@@ -1,39 +1,50 @@
-# 🌐 Enterprise Global Quality PPO Engine (BigQuery + App Script)
+# 🌐 Enterprise Global Quality PPO Engine (BigQuery + Apps Script)
 
-## 🚀 Overview
-This repository contains the core architecture of the **Global PPO (Performance Payment Objectives) System** for TELUS Quality departments. This is a mission-critical mission-critical data ecosystem that automates the lifecycle of quality incentives—from data collection via automated intake forms to final financial payout calculations in Google BigQuery.
+## 🚀 Project Overview
+This repository contains the end-to-end data infrastructure designed to manage and calculate **PPOs (Performance Payment Objectives)** for the Global Quality Department at **TELUS Digital**. 
 
----
-
-## 🏗️ System Architecture: The "Triple-Threat" Integration
-
-The solution is built on three specialized layers to ensure scalability and 100% data accuracy:
-
-### 1. ⚡ BigQuery Data Warehouse (The Core)
-* **Advanced SQL Modeling**: Complex scripts that process global quality metrics, applying multi-role eligibility rules and prorated calculations.
-* **Role-Based Logic**: Tailored analytical views for every Quality role within the organization.
-* **Data Integrity**: Centralized SSoT (Single Source of Truth) for auditing and financial compliance.
-
-### 2. 📄 Google Sheets Metric Hub (The Interface)
-* Dedicated metric repositories for each quality role.
-* Real-time data synchronization between operational inputs and the analytical engine.
-
-### 3. 🤖 Apps Script Automation (The Bridge)
-* **Automated Intake Forms**: Custom Google Apps Scripts that dynamically generate intake forms for each specific role.
-* **Data Routing**: Automated scripts that push form responses into the Metric Hub, eliminating manual data entry errors.
+The system automates the entire lifecycle of performance data: from dynamic intake form generation to complex multi-source consolidation in **Google BigQuery**, and finally, a dimensional layer optimized for **Looker Studio** executive dashboards.
 
 ---
 
-## 🛠️ Key Technical Features
-* **Global Scale**: Architecture designed to support the entire TELUS Quality organization across all regions.
-* **Modular PPO Logic**: Implementation of complex business rules for performance-based compensation.
-* **End-to-End Automation**: From the moment a metric is recorded in a form to the final BigQuery calculation, the process is touchless.
-* **Security & Governance**: Strict handling of sensitive financial and performance data.
+## 🏗️ Data Architecture & Pipeline Stages
+
+The project follows a modular **Medallion Architecture** (Raw > Silver > Gold) to ensure data integrity and scalability:
+
+
+
+### 1. 📥 Layer 01: Ingestion (Raw)
+* **Source:** 7 heterogeneous data sources (VOC, Quality, Team Dev, PPD, Productivity, Accuracy, and Targets Master).
+* **Automation:** Google Apps Scripts dynamically generate role-specific intake forms, pushing data directly into a centralized Metric Hub.
+
+### 2. ⚡ Layer 02: Normalization (Silver)
+* **Process:** Stored Procedures (SQL) perform deep cleaning and type casting.
+* **Logic:** Implementation of `FULL OUTER JOIN` strategies to consolidate all sources without data loss.
+* **Dynamic Weighting:** Metrics are weighted based on a `targets_master` table that adjusts goals according to the employee's role and effective date.
+
+### 3. 📉 Layer 03: Dimensional Modeling (Gold - Unpivot)
+* **Optimization:** A dedicated SQL layer transforms "wide" consolidated tables into "long" (unpivoted) formats.
+* **Purpose:** Specifically engineered for **Looker Studio** to allow dynamic filtering, time-series analysis, and cross-metric comparisons.
+
+### 4. 📊 Layer 04: Executive Reporting
+* **Outputs:** Automated Scorecards, Overall Summaries, and an Executive Dashboard for global leadership.
 
 ---
 
-## 📁 Repository Structure
+## 📂 Repository Structure
+
 ```text
+├── sql-queries/
+│   ├── quality-analyst/         # Quality Analyst Role (Entry Level)
+│   │   ├── 01-raw-ingestion/    # Schema definitions for raw tables
+│   │   ├── 02-normalization/    # ETL Stored Procedures (Consolidation)
+│   │   ├── 03-unpivot-layer/    # BI-ready views (Unpivot logic)
+│   │   └── 04-final-reporting/  # Executive Summary queries
+│   ├── quality-specialist/      # (Upcoming) Specialist Role logic
+│   └── quality-manager/         # (Upcoming) Management Role logic
+├── apps-script/                 # Automation code for Intake Forms
+├── docs/                        # System Architecture & Data Dictionary
+└── README.md
 Global-Quality-PPO-Engine/
 ├── sql-scripts/             # Complex BigQuery Queries by Role
 ├── apps-script/             # Automation code for Form Generation & Routing
