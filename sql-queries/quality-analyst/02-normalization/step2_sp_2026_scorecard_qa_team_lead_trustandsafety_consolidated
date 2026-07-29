@@ -1,0 +1,238 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_qa_team_lead_trustandsafety_consolidated`()
+BEGIN
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_qa_team_lead_trustandsafety_consolidated` AS
+
+  -- ===========================================================================
+  -- FILTRADO TEMPRANO: Purgamos nulos y basura de los orígenes de Trust & Safety
+  -- ===========================================================================
+  WITH rolled_up AS (
+    SELECT *,
+      REGEXP_REPLACE(TRIM(CAST(tl_wdid AS STRING)), r'\.0$', '') AS tl_wdid_str,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month_str,
+      REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', '') AS year_str
+    FROM `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_lead_trustandsafety_rolled_up_consolidated`
+    WHERE tl_wdid IS NOT NULL 
+      AND TRIM(CAST(tl_wdid AS STRING)) NOT IN ('', '-', 'NULL')
+  ),
+
+  non_rolled_up AS (
+    SELECT *,
+      REGEXP_REPLACE(TRIM(CAST(tl_wdid AS STRING)), r'\.0$', '') AS tl_wdid_str,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month_str,
+      REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', '') AS year_str
+    FROM `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_lead_trustandsafety_non_rolled_up_consolidated`
+    WHERE tl_wdid IS NOT NULL 
+      AND TRIM(CAST(tl_wdid AS STRING)) NOT IN ('', '-', 'NULL')
+  ),
+
+  /* --- CTE 1: BASE CONSOLIDATION (PRIMARY KEY Y CAMPOS UNIFICADOS) --- */
+  Base_Scorecard AS (
+    SELECT
+      'T&S Quality TL/Sr TL' AS role,
+      
+      -- PRIMARY KEY ESTÁNDAR DE LA SUITE: wdid_month_year_program_country
+      CONCAT(
+        COALESCE(r.tl_wdid_str, nr.tl_wdid_str), '_', 
+        COALESCE(r.month_str, nr.month_str), '_', 
+        COALESCE(r.year_str, nr.year_str),
+        IFNULL(CONCAT('_', r.program), ''),
+        IFNULL(CONCAT('_', COALESCE(r.country, nr.country)), '')
+      ) AS primary_key,
+
+      COALESCE(r.date, SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(nr.report_month), ' ', CAST(nr.report_year AS STRING)))) AS date,
+      COALESCE(r.month_str, nr.month_str) AS report_month,
+      SAFE_CAST(COALESCE(r.year_str, nr.year_str) AS INT64) AS report_year,
+      SAFE_CAST(COALESCE(r.tl_wdid_str, nr.tl_wdid_str) AS INT64) AS tl_wdid,
+      COALESCE(CAST(r.tl_name AS STRING), CAST(nr.tl_name AS STRING)) AS tl_name,
+      COALESCE(CAST(r.tl_manager AS STRING), CAST(nr.tl_manager AS STRING)) AS tl_manager,
+      COALESCE(CAST(r.tl_sr_manager AS STRING), CAST(nr.tl_sr_manager AS STRING)) AS tl_sr_manager,
+      COALESCE(CAST(r.country AS STRING), CAST(nr.country AS STRING)) AS country,
+      COALESCE(CAST(r.region AS STRING), CAST(nr.region AS STRING)) AS region,
+      r.program,
+
+      -- Componente: Accepted Appeals Block
+      r.accepted_appeals_business_category, r.accepted_appeals_kpi, r.accepted_appeals_target_master, r.accepted_appeals_weight_master, r.aa_actual, r.aa_score_target_program, r.accepted_appeals_performance_before_goal, r.accepted_appeals_ptg, r.acceptes_appeals_achievement_tier, r.accepted_appeals_points_obtained, r.accepted_appeals_weight_obtained, r.accepted_appeals_points_final_score, r.aa_notes, r.aa_kpi_applicable, r.aa_exempt, r.aa_reason,
+
+      -- Componente: Quality Block
+      r.qaptg_business_category, r.qa_kpi, r.quality_score_actual, r.quality_score_target_program, r.quality_notes, r.qa_kpi_applicable, r.qa_exempt, r.qa_reason, r.quality_weight_master, r.quality_ptg, r.quality_achievement_tier, r.quality_points_obtained, r.quality_weight_obtained, r.quality_points_final_score,
+
+      -- Componente: Service Delivery Block
+      r.sd_business_category, r.sd_kpi, r.sd_weight_master, r.sd_target_master, r.sd_qa_evals_completed, r.sd_qa_evals_target, r.sd_avg_evals_completed, r.sd_avg_accepted_appeals, r.sd_ptg, r.sd_achievement_tier, r.sd_metric_points, r.sd_weight_obtained, r.sd_points_final_score, r.sd_notes, r.sd_kpi_applicable, r.sd_exempt,
+
+      -- Componente: Productivity Block
+      r.productivity_business_category, r.productivity_kpi, r.qa_count, r.ts_calibrations_completed, r.ts_calibrations_required, r.ts_evals_completed, r.ts_evals_target, r.calibrations_ptg, r.evaluations_ptg, r.productivity_weight_master, r.productivity_target_master, r.productivity_ptg, r.qa_evals_na, r.ts_exempt, r.ts_exemption_reason, r.notes, r.productivity_achievement_tier, r.productivity_points_obtained, r.productivity_weight_earned, r.productivity_points_final_score,
+
+      -- Componente: Innovation Block
+      nr.innovation_businesscategory, nr.innovation_kpi, nr.innovation_kpi_applicable, nr.innovation_exempt, nr.innovation_reason, nr.innovation_high_count, nr.innovation_med_count, nr.innovation_low_count, nr.innovation_metric_points, nr.innovation_target, nr.innovation_weight, nr.innovation_ptg, nr.innovation_weight_obtained, nr.innovation_achievement, nr.innovation_points_obtained, nr.innovation_points_obtained_for_final_score_only,
+
+      -- Componente: PPD Block
+      nr.ppd_businesscategory, nr.ppd_kpi, nr.ppd_kpi_applicable, nr.ppd_exempt, nr.ppd_reason, nr.ppd_mandatory_completed, nr.ppd_required_courses, nr.ppd_target, nr.ppd_ptg, nr.ppd_weight, nr.ppd_achievement_category, nr.ppd_weight_obtained, nr.ppd_points_obtained, nr.ppd_points_obtained_for_final_score_only
+    FROM rolled_up r
+    FULL OUTER JOIN non_rolled_up nr
+      ON r.tl_wdid_str = nr.tl_wdid_str
+     AND r.month_str = nr.month_str
+     AND r.year_str = nr.year_str
+  ),
+
+  /* --- CTE 2: EXCLUSIVE YETG SOURCE INTEGRATION --- */
+  leadership_tl_agg AS (
+    SELECT 
+      REGEXP_REPLACE(TRIM(CAST(Employee_ID AS STRING)), r'\.0$', '') AS wdid,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month,
+      REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', '') AS year,
+      SAFE_CAST(leadership_ptg AS FLOAT64) AS leadership_ptg
+    FROM `ti-ca-ml-start.QA_Training_scorecards.global_qa_roster_with_scores`
+    WHERE Employee_ID IS NOT NULL
+  ),
+
+  /* --- CTE 3: ENLACE CON PILARES POTP Y YETG --- */
+  Scorecard_With_POTP AS (
+    SELECT
+      b.*,
+      
+      -- ===========================================================================
+      -- PILLAR INTEGRATION: YETG
+      -- ===========================================================================
+      CAST('My Team' AS STRING) AS yearly_evals_business_category,
+      CAST('Yearly Evaluations (% to goal)' AS STRING) AS yearly_evals_kpi,
+      1.00 AS yearly_evals_target_master,
+      0.10 AS yearly_evals_weight_master,
+      CASE WHEN b.report_month = 'JUN' THEN l.leadership_ptg ELSE NULL END AS yearly_evals_ptg,
+      CAST(CASE WHEN b.report_month = 'JUN' AND l.leadership_ptg IS NOT NULL THEN 'Yes' ELSE 'No' END AS STRING) AS yearly_evals_kpi_applicable,
+      
+      CASE 
+        WHEN b.report_month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 'Improvement Required'
+        WHEN l.leadership_ptg < 1.00 THEN 'Developing'
+        WHEN l.leadership_ptg < 1.01 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS yearly_evals_achievement_category,
+
+      CASE 
+        WHEN b.report_month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 1
+        WHEN l.leadership_ptg < 1.00 THEN 2
+        WHEN l.leadership_ptg < 1.01 THEN 3
+        ELSE 4
+      END AS yearly_evals_metric_points,
+
+      CASE 
+        WHEN b.report_month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 0.25
+        WHEN l.leadership_ptg < 1.00 THEN 0.50
+        WHEN l.leadership_ptg < 1.01 THEN 0.75
+        ELSE 1.00
+      END * 0.10 AS yearly_evals_weight_earned,
+
+      CASE 
+        WHEN b.report_month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 1
+        WHEN l.leadership_ptg < 1.00 THEN 2
+        WHEN l.leadership_ptg < 1.01 THEN 3
+        ELSE 4
+      END * 0.10 AS yearly_evals_points_final_score,
+
+      -- ===========================================================================
+      -- PILLAR INTEGRATION: POTP (10% WEIGHT)
+      -- ===========================================================================
+      CAST('My Team' AS STRING) AS potp_business_category,
+      CAST('% of Top Performers' AS STRING) AS potp_kpi,
+      p.count_top_performers AS potp_count_top_performers,
+      p.count_total AS potp_count_total,
+      CAST(CASE WHEN p.count_total IS NULL OR p.count_total = 0 THEN 'No' ELSE 'Yes' END AS STRING) AS potp_kpi_applicable,
+      CAST('No' AS STRING) AS potp_exempt,
+      CAST(NULL AS STRING) AS potp_reason,
+      0.10 AS potp_weight,
+      p.target_master AS potp_target,
+      p.potp_ptg AS potp_ptg,
+      
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 'Improvement Required'
+        WHEN p.potp_ptg < 0.90 THEN 'Developing'
+        WHEN p.potp_ptg < 0.95 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS potp_achievement_tier,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 1
+        WHEN p.potp_ptg < 0.90 THEN 2
+        WHEN p.potp_ptg < 0.95 THEN 3
+        ELSE 4
+      END AS potp_points_obtained,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 0.25
+        WHEN p.potp_ptg < 0.90 THEN 0.50
+        WHEN p.potp_ptg < 0.95 THEN 0.75
+        ELSE 1.00
+      END * 0.10 AS potp_weight_obtained,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 1
+        WHEN p.potp_ptg < 0.90 THEN 2
+        WHEN p.potp_ptg < 0.95 THEN 3
+        ELSE 4
+      END * 0.10 AS potp_points_for_final_score
+    FROM Base_Scorecard b
+    LEFT JOIN leadership_tl_agg l
+      ON REGEXP_REPLACE(TRIM(CAST(b.tl_wdid AS STRING)), r'\.0$', '') = l.wdid
+     AND b.report_month = l.month
+     AND REGEXP_REPLACE(TRIM(CAST(b.report_year AS STRING)), r'\.0$', '') = l.year
+    -- CRUCE INTEGRADO CON ID, MONTH, YEAR, PROGRAM, COUNTRY
+    LEFT JOIN `ti-ca-ml-start.QA_Training_scorecards.2026_potp_all_roles_etl_output` p
+      ON REGEXP_REPLACE(TRIM(CAST(b.tl_wdid AS STRING)), r'\.0$', '') = REGEXP_REPLACE(TRIM(CAST(p.inmediate_supervisor_id AS STRING)), r'\.0$', '')
+     AND b.report_month = UPPER(TRIM(SUBSTR(CAST(p.month AS STRING), 1, 3)))
+     AND REGEXP_REPLACE(TRIM(CAST(b.report_year AS STRING)), r'\.0$', '') = REGEXP_REPLACE(TRIM(CAST(p.year AS STRING)), r'\.0$', '')
+     AND (LOWER(TRIM(b.program)) = LOWER(TRIM(p.program)) OR (b.program IS NULL AND TRIM(p.program) IS NULL))
+     AND LOWER(TRIM(b.country)) = LOWER(TRIM(p.country))
+  ),
+
+  /* --- CTE 4: DAPT CALCULATIONS --- */
+  DAPT_Calculations AS (
+    SELECT
+      *,
+      CAST('All' AS STRING) AS final_score_business_category,
+      CAST('Final Score' AS STRING) AS final_score_kpi,
+
+      (COALESCE(accepted_appeals_weight_master, 0) * 4 + 
+        COALESCE(quality_weight_master, 0) * 4 + 
+        COALESCE(sd_weight_master, 0) * 4 + 
+        COALESCE(productivity_weight_master, 0) * 3 + 
+        COALESCE(innovation_weight, 0) * 4 + 
+        COALESCE(ppd_weight, 0) * 4 +
+        COALESCE(CASE WHEN report_month != 'JUN' OR yearly_evals_ptg IS NULL THEN 0 ELSE 0.10 END * 4, 0) + 
+        COALESCE(CASE WHEN potp_count_total IS NULL OR potp_count_total = 0 THEN 0 ELSE 0.10 END * 4, 0)) AS max_final_score_points_available,
+
+      (COALESCE(accepted_appeals_points_final_score, 0) + 
+        COALESCE(quality_points_final_score, 0) + 
+        COALESCE(sd_points_final_score, 0) + 
+        COALESCE(productivity_points_final_score, 0) + 
+        COALESCE(innovation_points_obtained_for_final_score_only, 0) + 
+        COALESCE(ppd_points_obtained_for_final_score_only, 0) +
+        COALESCE(yearly_evals_points_final_score, 0) + 
+        COALESCE(potp_points_for_final_score, 0)) AS final_score_points_obtained
+    FROM Scorecard_With_POTP
+  )
+
+  /* --- PART 5: SELECT FINAL WITH REALTIME RATIOS AND TIERS --- */
+  SELECT
+    *,
+    SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) AS final_score_ptg,
+    CASE 
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.87 THEN 'Excelling'
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.75 THEN 'Achieving'
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.50 THEN 'Developing'
+      ELSE 'Improvement Required'
+    END AS final_score_tier
+  FROM DAPT_Calculations;
+
+END;
