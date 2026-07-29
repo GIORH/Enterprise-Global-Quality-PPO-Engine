@@ -1,0 +1,112 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_regionallead_non_rolled_up_consolidated`()
+BEGIN
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_regional_lead_non_rolled_up_consolidated` AS
+  
+  WITH Raw_Data AS (
+    SELECT 
+      *,
+      -- REPARACIÓN SEI: Cálculo dinámico real basado en sei_score / sei_target
+      SAFE_DIVIDE(
+        SAFE_CAST(REPLACE(sei_score, '%', '') AS FLOAT64),
+        SAFE_CAST(REPLACE(sei_target, '%', '') AS FLOAT64)
+      ) AS sei_ptg_decimal,
+      
+      -- REPARACIÓN PPD: Cálculo dinámico real basado en courses_completed / courses_required
+      SAFE_DIVIDE(
+        SAFE_CAST(courses_completed AS FLOAT64),
+        SAFE_CAST(courses_required AS FLOAT64)
+      ) AS ppd_ptg_decimal
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qareglds_raw`
+  ),
+
+  Calculos_Metricas AS (
+    SELECT
+      *,
+      /* --- BLOQUE SEI (Service Excellence Index) --- */
+      'Service Excellence Index' AS sei_kpi,
+      'My Customer' AS sei_business_category,
+      0.15 AS sei_weight,
+      CASE 
+        WHEN sei_ptg_decimal < 0.90 THEN 'Improvement Required'
+        WHEN sei_ptg_decimal < 1.00 THEN 'Developing'
+        WHEN sei_ptg_decimal < 1.01 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS sei_achievement_category,
+      CASE 
+        WHEN sei_ptg_decimal < 0.90 THEN 1
+        WHEN sei_ptg_decimal < 1.00 THEN 2
+        WHEN sei_ptg_decimal < 1.01 THEN 3
+        ELSE 4
+      END AS sei_points_obtained,
+
+      /* --- BLOQUE PPD (Personal Professional Development) --- */
+      'PPD' AS ppd_kpi,
+      'My Team' AS ppd_business_category,
+      0.10 AS ppd_weight,
+      
+      -- REPARACIÓN EN CASCADA: Evaluaciones basadas estrictamente en el nuevo ppd_ptg_decimal
+      CASE 
+        WHEN ppd_ptg_decimal < 0.50 THEN 'Improvement Required'
+        WHEN ppd_ptg_decimal < 1.00 THEN 'Developing'
+        WHEN ppd_ptg_decimal = 1.00 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS ppd_achievement_category,
+      CASE 
+        WHEN ppd_ptg_decimal < 0.50 THEN 1
+        WHEN ppd_ptg_decimal < 1.00 THEN 2
+        WHEN ppd_ptg_decimal = 1.00 THEN 3
+        ELSE 4
+      END AS ppd_points_obtained
+    FROM Raw_Data
+  )
+
+  SELECT 
+    -- Bloque Identidad (Sustitución de timestamp crudo por objeto DATE corto YYYY-MM-01)
+    pk, 
+    SAFE.PARSE_DATE('%Y-%m-%d', CONCAT(SAFE_CAST(report_year AS STRING), '-',
+      CASE LOWER(TRIM(report_month))
+        WHEN 'january' THEN '01' WHEN 'february' THEN '02' WHEN 'march' THEN '03' 
+        WHEN 'april' THEN '04' WHEN 'may' THEN '05' WHEN 'june' THEN '06' 
+        WHEN 'july' THEN '07' WHEN 'august' THEN '08' WHEN 'september' THEN '09' 
+        WHEN 'october' THEN '10' WHEN 'november' THEN '11' WHEN 'december' THEN '12'
+        ELSE LPAD(TRIM(report_month), 2, '0') 
+      END, '-01')) AS timestamp,
+    submitter_email, 
+    report_month, 
+    report_year, 
+    region, 
+    role, 
+    lead_wdid, 
+    lead_name,
+
+    -- Bloque SEI Final (11 columnas estándar con el cálculo dinámico string)
+    sei_kpi, 
+    sei_business_category, 
+    sei_weight, 
+    sei_score, 
+    sei_target, 
+    FORMAT('%.2f%%', sei_ptg_decimal * 100) AS sei_ptg, 
+    sei_achievement_category,
+    sei_points_obtained,
+    (CAST(sei_points_obtained AS FLOAT64) / 4) * 0.15 AS sei_weight_obtained,
+    CAST(sei_points_obtained AS FLOAT64) * 0.15 AS sei_points_final_score,
+    sei_comments,
+
+    -- Bloque PPD Final (11 columnas estándar reparadas)
+    ppd_kpi, 
+    ppd_business_category, 
+    ppd_weight, 
+    1.0 AS ppd_target,                                   -- REPARACIÓN: Modificado de 0.10 a 1.0 (100% Target)
+    courses_completed, 
+    courses_required, 
+    FORMAT('%.2f%%', ppd_ptg_decimal * 100) AS ppd_ptg, -- REPARACIÓN: Muestra el porcentaje de cursos completados
+    ppd_achievement_category,
+    ppd_points_obtained,
+    (CAST(ppd_points_obtained AS FLOAT64) / 4) * 0.10 AS ppd_weight_obtained,
+    CAST(ppd_points_obtained AS FLOAT64) * 0.10 AS ppd_points_final_score,
+    ppd_comments
+
+  FROM Calculos_Metricas;
+
+END;
