@@ -1,0 +1,142 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.a_sp_2026_coaching_leadership_general`()
+BEGIN
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_coaching_leadership_general` AS
+
+  -- =========================================================================
+  -- 1. ROLE: CX Quality Team Lead (Coachees: CX Quality Analyst)
+  -- =========================================================================
+  SELECT
+    SAFE.PARSE_DATE('%b %Y', CONCAT(INITCAP(SUBSTR(TRIM(CAST(report_month AS STRING)), 1, 3)), ' ', REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', ''))) AS date,
+    report_month,
+    report_year,
+    tl_wdid AS coach_wdid,
+    tl_name AS coach_name,
+    tm_wdid AS coachee_wdid,
+    tm_name AS coachee_name,
+    country,
+    region,
+    NULLIF(SAFE_CAST(coachings_performed AS FLOAT64), 0) AS coachings_performed,
+    NULLIF(SAFE_CAST(coachings_target AS FLOAT64), 0) AS coachings_target,
+    notes,
+    exempt,
+    exempt_reason,
+    'CX Quality Analyst' AS coachee_role
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_cx_qatl_coaching_raw`
+
+  UNION ALL
+
+  -- =========================================================================
+  -- 2. ROLE: CX Quality Manager (Coachees: CX Quality Team Lead)
+  -- =========================================================================
+  SELECT
+    SAFE.PARSE_DATE('%b %Y', CONCAT(INITCAP(SUBSTR(TRIM(CAST(report_month AS STRING)), 1, 3)), ' ', REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', ''))) AS date,
+    report_month,
+    report_year,
+    mngr_wdid AS coach_wdid,
+    mngr_name AS coach_name,
+    tl_wdid AS coachee_wdid,
+    tl_name AS coachee_name,
+    country,
+    region,
+    NULLIF(SAFE_CAST(coachings_performed AS FLOAT64), 0) AS coachings_performed,
+    NULLIF(SAFE_CAST(coachings_target AS FLOAT64), 0) AS coachings_target,
+    notes,
+    exempt,
+    exempt_reason,
+    'CX Quality Team Lead' AS coachee_role
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_cx_qamnr_coaching_raw`
+
+  UNION ALL
+
+  -- =========================================================================
+  -- 3. ROLE: CX Regional Lead / Director (Coachees: CX Quality Manager/Sr Manager)
+  -- =========================================================================
+  SELECT
+    SAFE.PARSE_DATE('%b %Y', CONCAT(INITCAP(SUBSTR(TRIM(CAST(report_month AS STRING)), 1, 3)), ' ', REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', ''))) AS date,
+    report_month,
+    report_year,
+    mgr_l1_wdid AS coach_wdid,
+    mgr_l1_name AS coach_name,
+    mngr_wdid AS coachee_wdid,
+    mgr_name AS coachee_name,
+    country,
+    region,
+    NULLIF(SAFE_CAST(coachings_performed AS FLOAT64), 0) AS coachings_performed,
+    NULLIF(SAFE_CAST(coachings_target AS FLOAT64), 0) AS coachings_target,
+    notes,
+    exempt,
+    exempt_reason,
+    'CX Quality Manager/Sr Manager' AS coachee_role
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_cx_regionallead_directors_coaching_raw`
+
+  UNION ALL
+
+  -- =========================================================================
+  -- 4. ROLE: T&S Quality Team Lead (Coachees: T&S Quality Analyst)
+  -- =========================================================================
+  SELECT
+    SAFE.PARSE_DATE('%b %Y', CONCAT(INITCAP(SUBSTR(TRIM(CAST(report_month AS STRING)), 1, 3)), ' ', REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', ''))) AS date,
+    report_month,
+    report_year,
+    tl_wdid AS coach_wdid,
+    tl_name AS coach_name,
+    tm_wdid AS coachee_wdid,
+    tm_name AS coachee_name,
+    country,
+    region,
+    NULLIF(SAFE_CAST(coachings_performed AS FLOAT64), 0) AS coachings_performed,
+    NULLIF(SAFE_CAST(coachings_target AS FLOAT64), 0) AS coachings_target,
+    notes,
+    exempt,
+    exempt_reason,
+    'T&S Quality Analyst' AS coachee_role
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_trustandsafety_qatl_coaching_raw`
+
+  UNION ALL
+
+  -- =========================================================================
+  -- 5. ROLE: T&S Quality Manager (Coachees: T&S Quality TL/Sr TL)
+  -- =========================================================================
+  SELECT
+    SAFE.PARSE_DATE('%b %Y', CONCAT(INITCAP(SUBSTR(TRIM(CAST(report_month AS STRING)), 1, 3)), ' ', REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', ''))) AS date,
+    report_month,
+    report_year,
+    mngr_wdid AS coach_wdid,
+    mngr_name AS coach_name,
+    tl_wdid AS coachee_wdid,
+    tl_name AS coachee_name,
+    country,
+    region,
+    NULLIF(SAFE_CAST(coachings_performed AS FLOAT64), 0) AS coachings_performed,
+    NULLIF(SAFE_CAST(coachings_target AS FLOAT64), 0) AS coachings_target,
+    notes,
+    exempt,
+    exempt_reason,
+    'T&S Quality TL/Sr TL' AS coachee_role
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_trustandsafety_qamnr_coaching_raw`
+
+  UNION ALL
+
+  -- =========================================================================
+  -- 6. ROLE: T&S Regional Lead / Director (Coachees: T&S Quality Manager/Sr Manager)
+  -- =========================================================================
+  SELECT
+    SAFE.PARSE_DATE('%b %Y', CONCAT(INITCAP(SUBSTR(TRIM(CAST(report_month AS STRING)), 1, 3)), ' ', REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', ''))) AS date,
+    report_month,
+    report_year,
+    mgr_l1_wdid AS coach_wdid,
+    mgr_l1_name AS coach_name,
+    mngr_wdid AS coachee_wdid,
+    mgr_name AS coachee_name,
+    country,
+    region,
+    NULLIF(SAFE_CAST(coachings_performed AS FLOAT64), 0) AS coachings_performed,
+    NULLIF(SAFE_CAST(coachings_target AS FLOAT64), 0) AS coachings_target,
+    notes,
+    exempt,
+    exempt_reason,
+    'T&S Quality Manager/Sr Manager' AS coachee_role
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_trustandsafety_regionallead_directors_coaching_raw`;
+
+END;
