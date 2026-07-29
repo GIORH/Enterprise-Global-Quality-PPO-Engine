@@ -1,0 +1,123 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_qualitypercenttogoal_ETL`()
+BEGIN
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_qualitypercenttogoal_ETL` AS
+
+ WITH QA_Quality_Source AS (
+  SELECT
+    MAX(timestamp) AS timestamp, 
+    SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+    report_month, 
+    report_year, 
+    tl_wdid, 
+    tl_name, 
+    tl_manager, 
+    tl_sr_manager, 
+    program, 
+    country, 
+    region,
+    
+    -- Agrupación promediada (Rolled up) con protección contra dilución
+    AVG(CASE WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(quality_score_actual AS FLOAT64) END) AS quality_score_actual,
+    AVG(CASE WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(quality_score_target_program AS FLOAT64) END) AS quality_score_target_program,
+    
+    -- Banderas condicionales a nivel de equipo completo
+    IF(COUNTIF(UPPER(TRIM(qa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS qa_kpi_applicable,
+    IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS qa_exempt,
+    IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), 'Whole team exempt', NULL) AS quality_notes,
+    IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), MAX(qa_reason), NULL) AS qa_reason
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+  GROUP BY report_month, report_year, tl_wdid, tl_name, tl_manager, tl_sr_manager, program, country, region
+),
+
+  TL_Quality_PTG AS (
+    SELECT
+      *,
+      'My Customer' AS qaptg_business_category, 
+      'Quality % to Goal' AS qa_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS quality_weight_master,
+      
+      -- Porcentaje final de cumplimiento (PTG) de calidad
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(quality_score_actual, quality_score_target_program) 
+      END AS quality_ptg
+    FROM QA_Quality_Source
+  ),
+
+  TL_Quality_Scores AS (
+    SELECT
+      *,
+      -- Asignación de Tiers oficiales basados en rangos de cumplimiento de calidad
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN quality_ptg >= 0.90 AND quality_ptg <= 0.9999 THEN 'Developing' 
+        WHEN quality_ptg >= 1.00 AND quality_ptg <= 1.0099 THEN 'Achieving' 
+        WHEN quality_ptg >= 1.01 THEN 'Excelling' 
+        ELSE NULL 
+      END AS quality_achievement_tier,
+      
+      -- Obtención de puntos de matriz para calidad
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 1 
+        WHEN quality_ptg >= 0.90 AND quality_ptg <= 0.9999 THEN 2 
+        WHEN quality_ptg >= 1.00 AND quality_ptg <= 1.0099 THEN 3 
+        WHEN quality_ptg >= 1.01 THEN 4 
+        ELSE 0 
+      END AS quality_points_obtained
+    FROM TL_Quality_PTG
+  ),
+
+  TL_Quality_Final_Block AS (
+    SELECT
+      *,
+      -- Ponderación y cálculo de Score final del componente de calidad
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE (quality_points_obtained / 4) * quality_weight_master 
+      END AS quality_weight_obtained,
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE quality_points_obtained * quality_weight_master 
+      END AS quality_points_final_score
+    FROM TL_Quality_Scores
+  )
+
+SELECT 
+  -- Metadata & Dimensions Base
+  timestamp,
+  date,
+  report_month,
+  report_year,
+  tl_wdid,
+  tl_name,
+  tl_manager,
+  tl_sr_manager,
+  program,
+  country,
+  region,
+
+  -- Isolated Quality Metrics
+  qaptg_business_category,
+  qa_kpi,
+  quality_score_actual,
+  quality_score_target_program,
+  quality_notes,
+  qa_kpi_applicable,
+  qa_exempt,
+  qa_reason,
+  quality_weight_master,
+  quality_ptg,
+  quality_achievement_tier,
+  quality_points_obtained,
+  quality_weight_obtained,
+  quality_points_final_score
+
+FROM TL_Quality_Final_Block;
+
+END;
