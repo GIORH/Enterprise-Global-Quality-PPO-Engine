@@ -1,0 +1,152 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_servicedelivery_ETL`()
+BEGIN
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_servicedelivery_ETL` AS
+
+ WITH TL_Service_Delivery_Source AS (
+  SELECT
+    MAX(timestamp) AS timestamp, 
+    SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+    report_month, 
+    report_year, 
+    tl_wdid, 
+    tl_name, 
+    tl_manager, 
+    tl_sr_manager, 
+    program, 
+    country, 
+    region,
+    
+    -- 1. Evaluaciones de QA (Bloque de Producción)
+    SUM(CASE WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' OR UPPER(TRIM(prod_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(qa_evals_completed AS FLOAT64) END) AS sd_qa_evals_completed,
+    SUM(CASE WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' OR UPPER(TRIM(prod_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(qa_evals_target AS FLOAT64) END) AS sd_qa_evals_target,
+    
+    -- 2. Target Program de Apelaciones Aceptadas (sd_aa_actual eliminada por solicitud)
+    SUM(CASE WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(aa_score_target_program AS FLOAT64) END) AS sd_aa_score_target_program,
+    
+    -- Banderas de control para no diluir resultados
+    IF(COUNTIF(UPPER(TRIM(prod_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS sd_kpi_applicable,
+    IF(COUNTIF(UPPER(TRIM(prod_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS sd_exempt,
+    IF(COUNTIF(UPPER(TRIM(aa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS sd_aa_kpi_applicable,
+    IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS sd_aa_exempt,
+    MAX(notes_prod) AS sd_notes
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+  GROUP BY report_month, report_year, tl_wdid, tl_name, tl_manager, tl_sr_manager, program, country, region
+),
+
+  TL_Service_Delivery_Percentages AS (
+    SELECT
+      *,
+      -- Columnas constantes de inicio del bloque
+      'My Business' AS sd_business_category, 
+      'Service Delivery' AS sd_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(sd_kpi_applicable)) = 'NO' OR UPPER(TRIM(sd_exempt)) = 'YES' THEN NULL 
+        ELSE 0.10 
+      END AS sd_weight_master,
+      1.00 AS sd_target_master,
+      
+      -- Porcentaje 1: Evaluaciones Completadas
+      CASE 
+        WHEN UPPER(TRIM(sd_kpi_applicable)) = 'NO' OR UPPER(TRIM(sd_exempt)) = 'YES' THEN NULL
+        ELSE SAFE_DIVIDE(sd_qa_evals_completed, sd_qa_evals_target)
+      END AS sd_avg_evals_completed,
+      
+      -- Porcentaje 2: Desempeño de Apelaciones Aceptadas corregido (Target / Evals Target)
+      CASE 
+        WHEN UPPER(TRIM(sd_aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(sd_aa_exempt)) = 'YES' THEN NULL
+        ELSE SAFE_DIVIDE(sd_aa_score_target_program, sd_qa_evals_target)
+      END AS sd_avg_accepted_appeals
+    FROM TL_Service_Delivery_Source
+  ),
+
+  TL_Service_Delivery_PTG AS (
+    SELECT
+      *,
+      -- Porcentaje de cumplimiento final (% to Goal) basado en el promedio de los 2 porcentajes
+      CASE 
+        WHEN sd_avg_evals_completed IS NULL AND sd_avg_accepted_appeals IS NULL THEN NULL
+        ELSE SAFE_DIVIDE(
+          IFNULL(sd_avg_evals_completed, 0) + IFNULL(sd_avg_accepted_appeals, 0), 
+          (CASE WHEN sd_avg_evals_completed IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN sd_avg_accepted_appeals IS NOT NULL THEN 1 ELSE 0 END)
+        ) 
+      END AS sd_ptg
+    FROM TL_Service_Delivery_Percentages
+  ),
+
+  TL_Service_Delivery_Scores AS (
+    SELECT
+      *,
+      -- Mapeo de Tiers oficiales
+      CASE 
+        WHEN sd_ptg IS NULL THEN NULL 
+        WHEN sd_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN sd_ptg >= 0.90 AND sd_ptg <= 0.9999 THEN 'Developing' 
+        WHEN sd_ptg >= 1.00 AND sd_ptg <= 1.0099 THEN 'Achieving' 
+        WHEN sd_ptg >= 1.01 THEN 'Excelling' 
+        ELSE NULL 
+      END AS sd_achievement_tier,
+      
+      -- Asignación de puntos obtenidos
+      CASE 
+        WHEN sd_ptg IS NULL THEN NULL 
+        WHEN sd_ptg < 0.90 THEN 1 
+        WHEN sd_ptg >= 0.90 AND sd_ptg <= 0.9999 THEN 2 
+        WHEN sd_ptg >= 1.00 AND sd_ptg <= 1.0099 THEN 3 
+        WHEN sd_ptg >= 1.01 THEN 4 
+        ELSE 0 
+      END AS sd_metric_points
+    FROM TL_Service_Delivery_PTG
+  ),
+
+  TL_Service_Delivery_Final_Block AS (
+    SELECT
+      *,
+      -- Pesos y puntajes ponderados finales
+      CASE 
+        WHEN sd_metric_points IS NULL THEN NULL 
+        ELSE (sd_metric_points / 4) * sd_weight_master 
+      END AS sd_weight_obtained,
+      CASE 
+        WHEN sd_metric_points IS NULL THEN NULL 
+        ELSE sd_metric_points * sd_weight_master 
+      END AS sd_points_final_score
+    FROM TL_Service_Delivery_Scores
+  )
+
+SELECT 
+  -- Dimensiones Base
+  timestamp,
+  date,
+  report_month,
+  report_year,
+  tl_wdid,
+  tl_name,
+  tl_manager,
+  tl_sr_manager,
+  program,
+  country,
+  region,
+
+  -- Campos del bloque de Service Delivery Consolidados
+  sd_business_category,
+  sd_kpi,
+  sd_weight_master,
+  sd_target_master,
+  sd_qa_evals_completed,
+  sd_qa_evals_target,
+  sd_avg_evals_completed,
+  sd_aa_score_target_program,
+  sd_avg_accepted_appeals,
+  sd_ptg,
+  sd_achievement_tier,
+  sd_metric_points,
+  sd_weight_obtained,
+  sd_points_final_score,
+  sd_notes,
+  sd_kpi_applicable,
+  sd_exempt
+
+FROM TL_Service_Delivery_Final_Block;
+
+END;
