@@ -1,0 +1,267 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_qa_team_lead_consolidated`()
+BEGIN
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_team_lead_consolidated` AS
+  
+  WITH 
+    /* --- PASO 1: NORMALIZACIÓN DE FUENTES CON SANITIZACIÓN DE LLAVES --- */
+    rolled_src AS (
+      SELECT 
+        REGEXP_REPLACE(TRIM(CAST(tl_wdid AS STRING)), r'\.0$', '') as wdid, 
+        UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) as month, -- Definitive 3-Letter Upper Standard
+        SAFE_CAST(report_year AS STRING) as year, 
+        TRIM(program) as program,
+        * EXCEPT (tl_wdid, report_month, report_year, program, primary_key)
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_tl_rolled_up_consolidated`
+    ),
+
+    non_rolled_src AS (
+      SELECT 
+        REGEXP_REPLACE(TRIM(CAST(tl_wdid AS STRING)), r'\.0$', '') as wdid, 
+        UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) as month, -- Definitive 3-Letter Upper Standard
+        SAFE_CAST(report_year AS STRING) as year,
+        * EXCEPT (tl_wdid, report_month, report_year, primary_key)
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_tl_non_rolled_up_consolidated`
+    ),
+
+    /* --- INTEGRACIÓN EXCLUSIVA DE YETG (UNIFIED MONTH) --- */
+    leadership_tl_agg AS (
+      SELECT 
+        REGEXP_REPLACE(TRIM(CAST(Employee_ID AS STRING)), r'\.0$', '') AS wdid,
+        UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month, -- Definitive 3-Letter Upper Standard
+        SAFE_CAST(report_year AS STRING) AS year,
+        SAFE_CAST(leadership_ptg AS FLOAT64) AS leadership_ptg
+      FROM `ti-ca-ml-start.QA_Training_scorecards.global_qa_roster_with_scores`
+      WHERE Employee_ID IS NOT NULL
+    ),
+
+    /* --- PASO 2: ESQUELETO MAESTRO CON BLINDAJE DE IDs (CORREGIDO PARA GEOGRAFIA) --- */
+    master_skeleton AS (
+      -- 1. Los registros de producción
+      SELECT DISTINCT wdid, month, year, program, country, region FROM rolled_src
+      WHERE wdid IS NOT NULL AND TRIM(wdid) NOT IN ('', '-', 'NULL')
+      UNION DISTINCT
+      -- 2. Los registros huérfanos de desarrollo (Innovation/PPD)
+      SELECT DISTINCT wdid, month, year, CAST(NULL AS STRING) as program, country, region 
+      FROM non_rolled_src n
+      WHERE NOT EXISTS (
+        SELECT 1 FROM rolled_src r 
+        WHERE r.wdid = n.wdid AND r.month = n.month AND r.year = n.year
+      )
+      AND n.wdid IS NOT NULL AND TRIM(n.wdid) NOT IN ('', '-', 'NULL')
+    ),
+
+    /* --- PASO 3: UNIFICACIÓN DE DATOS DEMOGRÁFICOS Y NORMALIZACIÓN DE ROL (CORREGIDO) --- */
+    demographics AS (
+      SELECT 
+        wdid, month, year, program, country, region,
+        -- Protección contra ANY_VALUE forzando el rol extendido oficial de la compañía
+        MAX(CASE 
+          WHEN role IN ('CX Quality Team Lead', 'CX Quality Team Lead and Sr Team lead') THEN 'CX Quality Team Lead and Sr Team lead'
+          ELSE role 
+        END) as role,
+        ANY_VALUE(tl_name) as tl_name,
+        ANY_VALUE(tl_manager) as tl_manager,
+        ANY_VALUE(tl_sr_manager) as tl_sr_manager
+      FROM (
+        SELECT wdid, month, year, program, country, region, role, tl_name, tl_manager, tl_sr_manager FROM rolled_src
+        UNION ALL
+        SELECT wdid, month, year, CAST(NULL AS STRING) as program, country, region, 'CX Quality Team Lead and Sr Team lead' as role, tl_name, tl_manager, tl_sr_manager FROM non_rolled_src
+      )
+      GROUP BY 1, 2, 3, 4, 5, 6
+    )
+
+  /* --- PASO 4: ENSAMBLE FINAL CON SCORE TOTAL DINÁMICO (DAPT) --- */
+  SELECT 
+    base.*,
+    
+    -- Porcentaje final de logro dinámico protegido contra divisiones por cero
+    SAFE_DIVIDE(base.final_score_points_obtained, base.max_final_score_points_available) AS final_score_ptg,
+    
+    -- Mapeo final de Tiers basado exactamente en los buckets individuales solicitados
+    CASE 
+      WHEN SAFE_DIVIDE(base.final_score_points_obtained, base.max_final_score_points_available) IS NULL THEN NULL
+      WHEN SAFE_DIVIDE(base.final_score_points_obtained, base.max_final_score_points_available) < 0.50 THEN 'Improvement Required'
+      WHEN SAFE_DIVIDE(base.final_score_points_obtained, base.max_final_score_points_available) < 0.75 THEN 'Developing'
+      WHEN SAFE_DIVIDE(base.final_score_points_obtained, base.max_final_score_points_available) < 0.87 THEN 'Achieving'
+      ELSE 'Excelling'
+    END AS final_score_tier
+
+  FROM (
+    SELECT 
+      -- AÑADIDO EL COUNTRY A LA PK PARA EVITAR DUPLICADOS POR MULTI-REGION
+      CONCAT(s.wdid, '_', s.month, '_', s.year, IFNULL(CONCAT('_', s.program), ''), '_', s.country) as primary_key,
+      s.wdid as tl_wdid,
+      s.month as report_month,
+      s.year as report_year,
+      s.program,
+      d.role,
+      d.tl_name,
+      d.tl_manager,
+      d.tl_sr_manager,
+      d.country,
+      d.region,
+      -- Mantiene todos tus alias originales de producción
+      r.* EXCEPT (wdid, month, year, program, role, tl_name, tl_manager, tl_sr_manager, country, region),
+      -- Mantiene todos tus alias originales de desarrollo corregido para apuntar a ppd_...
+      n.* EXCEPT (wdid, month, year, tl_name, tl_manager, tl_sr_manager, country, region, ppd_points_obtained_for_final_score_only),
+      -- Tu renombramiento específico de PPD con el origen correcto
+      n.ppd_points_obtained_for_final_score_only as ppd_points_obtained_for_final_score_only,
+      
+      -- ===========================================================================
+      -- INYECCIÓN DE NUEVA MÉTRICA: YETG (UPDATED TO THE DEFINITIVE JUNE 'JUN' RULE)
+      -- ===========================================================================
+      CAST('My Team' AS STRING) AS yearly_evals_business_category,
+      CAST('Yearly Evaluations (% to goal)' AS STRING) AS yearly_evals_kpi,
+      
+      -- Placeholders estructurales estables todo el año para proteger el Unpivot del Paso 3
+      1.00 AS yearly_evals_target_master,
+      0.10 AS yearly_evals_weight_master,
+      CASE WHEN s.month = 'JUN' THEN l.leadership_ptg ELSE NULL END AS yearly_evals_ptg,
+      CAST(CASE WHEN s.month = 'JUN' AND l.leadership_ptg IS NOT NULL THEN 'Yes' ELSE 'No' END AS STRING) AS yearly_evals_kpi_applicable,
+      
+      CASE 
+        WHEN s.month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 'Improvement Required'
+        WHEN l.leadership_ptg < 1.00 THEN 'Developing'
+        WHEN l.leadership_ptg < 1.01 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS yearly_evals_achievement_category,
+
+      CASE 
+        WHEN s.month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 1
+        WHEN l.leadership_ptg < 1.00 THEN 2
+        WHEN l.leadership_ptg < 1.01 THEN 3
+        ELSE 4
+      END AS yearly_evals_metric_points,
+
+      CASE 
+        WHEN s.month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 0.25
+        WHEN l.leadership_ptg < 1.00 THEN 0.50
+        WHEN l.leadership_ptg < 1.01 THEN 0.75
+        ELSE 1.00
+      END * 0.10 AS yearly_evals_weight_earned,
+
+      CASE 
+        WHEN s.month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 1
+        WHEN l.leadership_ptg < 1.00 THEN 2
+        WHEN l.leadership_ptg < 1.01 THEN 3
+        ELSE 4
+      END * 0.10 AS yearly_evals_points_final_score,
+      
+      -- ===========================================================================
+      -- INTEGRACIÓN QUIRÚRGICA DEL NUEVO PILAR: POTP (10% WEIGHT)
+      -- ===========================================================================
+      CAST('My Team' AS STRING) AS potp_business_category,
+      CAST('% of Top Performers' AS STRING) AS potp_kpi,
+      p.count_top_performers AS potp_count_top_performers,
+      p.count_total AS potp_count_total,
+      CAST(CASE WHEN p.count_total IS NULL OR p.count_total = 0 THEN 'No' ELSE 'Yes' END AS STRING) AS potp_kpi_applicable,
+      CAST('No' AS STRING) AS potp_exempt,
+      CAST(NULL AS STRING) AS potp_reason,
+      0.10 AS potp_weight,
+      p.target_master AS potp_target,
+      p.potp_ptg AS potp_ptg,
+      
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 'Improvement Required'
+        WHEN p.potp_ptg < 0.90 THEN 'Developing'
+        WHEN p.potp_ptg < 0.95 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS potp_achievement_tier,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 1
+        WHEN p.potp_ptg < 0.90 THEN 2
+        WHEN p.potp_ptg < 0.95 THEN 3
+        ELSE 4
+      END AS potp_points_obtained,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 0.25
+        WHEN p.potp_ptg < 0.90 THEN 0.50
+        WHEN p.potp_ptg < 0.95 THEN 0.75
+        ELSE 1.00
+      END * 0.10 AS potp_weight_obtained,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 1
+        WHEN p.potp_ptg < 0.90 THEN 2
+        WHEN p.potp_ptg < 0.95 THEN 3
+        ELSE 4
+      END * 0.10 AS potp_points_for_final_score,
+      
+      -- Pilares de metadatos estandarizados para el Unpivot del Paso 3
+      CAST('All' AS STRING) AS final_score_business_category,
+      CAST('Final Score' AS STRING) AS final_score_kpi,
+      
+      -- ACTUALIZACIÓN EXCLUSIVA DAPT: Suma de componentes originales + YETG (JUN) + POTP
+      (
+        COALESCE(r.qa_points_obtained_for_final_score_only, 0) +
+        COALESCE(r.voc_points_obtained_for_final_score_only, 0) +
+        COALESCE(r.accuracy_points_obtained_for_final_score_only, 0) +
+        COALESCE(r.service_delivery_points_obtained_for_final_score_only, 0) +
+        COALESCE(r.productivity_points_obtained_for_final_score_only, 0) +
+        COALESCE(n.innovation_points_obtained_for_final_score_only, 0) +
+        COALESCE(n.ppd_points_obtained_for_final_score_only, 0) +
+        COALESCE(CASE 
+          WHEN s.month != 'JUN' THEN NULL
+          WHEN l.leadership_ptg IS NULL THEN NULL
+          WHEN l.leadership_ptg < 0.90 THEN 1
+          WHEN l.leadership_ptg < 1.00 THEN 2
+          WHEN l.leadership_ptg < 1.01 THEN 3
+          ELSE 4
+        END * 0.10, 0) + -- Condicionado de forma exclusiva a JUN
+        COALESCE(CASE 
+          WHEN p.count_total IS NULL OR p.count_total = 0 THEN 0
+          WHEN p.potp_ptg < 0.75 THEN 1
+          WHEN p.potp_ptg < 0.90 THEN 2
+          WHEN p.potp_ptg < 0.95 THEN 3
+          ELSE 4
+        END * 0.10, 0)
+      ) AS final_score_points_obtained,
+
+      -- ACTUALIZACIÓN EXCLUSIVA DAPT: Techo disponible incluyendo dinámicamente YETG (JUN) + POTP
+      (
+        COALESCE(r.qa_weight, 0) * 4 +
+        COALESCE(r.voc_weight, 0) * 4 +
+        COALESCE(r.accuracy_weight_master, 0) * 4 +
+        COALESCE(r.service_delivery_weight_master, 0) * 4 +
+        COALESCE(r.productivity_weight, 0) * 3 +
+        COALESCE(n.innovation_weight, 0) * 4 +
+        COALESCE(n.ppd_weight, 0) * 4 +
+        COALESCE(CASE WHEN s.month != 'JUN' OR l.leadership_ptg IS NULL THEN 0 ELSE 0.10 END * 4, 0) + -- El techo disponible cae a 0 fuera de JUN
+        COALESCE(CASE WHEN p.count_total IS NULL OR p.count_total = 0 THEN 0 ELSE 0.10 END * 4, 0)
+      ) AS max_final_score_points_available
+
+    FROM master_skeleton s
+    -- JOINS ACTUALIZADOS PARA INCLUIR LA GEOGRAFÍA AL CRUZAR CON DATOS OPERATIVOS
+    LEFT JOIN demographics d ON s.wdid = d.wdid AND s.month = d.month AND s.year = d.year AND (s.program = d.program OR (s.program IS NULL AND d.program IS NULL)) AND s.country = d.country AND s.region = d.region
+    LEFT JOIN rolled_src r   ON s.wdid = r.wdid AND s.month = r.month AND s.year = r.year AND s.program = r.program AND s.country = r.country AND s.region = r.region
+    -- ESTE JOIN SE MANTIENE INTACTO PARA QUE LAS MÉTRICAS NON-ROLLED SE REPLIQUEN EN TODAS LAS REGIONES
+    LEFT JOIN non_rolled_src n ON s.wdid = n.wdid AND s.month = n.month AND s.year = n.year
+    
+    -- LEFT JOIN EXCLUSIVO: Coupling YETG data seamlessly using unified identity keys
+    LEFT JOIN leadership_tl_agg l ON s.wdid = l.wdid AND s.month = l.month AND s.year = l.year
+    
+    -- Cruce directo con la quíntuple llave compuesta nativa adaptada al estándar de 3 letras
+    LEFT JOIN `ti-ca-ml-start.QA_Training_scorecards.2026_potp_all_roles_etl_output` p
+      ON s.wdid = REGEXP_REPLACE(TRIM(CAST(p.inmediate_supervisor_id AS STRING)), r'\.0$', '')
+     AND s.month = UPPER(TRIM(SUBSTR(CAST(p.month AS STRING), 1, 3)))
+     AND s.year = SAFE_CAST(p.year AS STRING)
+     AND (s.program = TRIM(p.program) OR (s.program IS NULL AND TRIM(p.program) IS NULL))
+     AND LOWER(TRIM(s.country)) = LOWER(TRIM(p.country))
+  ) AS base;
+
+END;
