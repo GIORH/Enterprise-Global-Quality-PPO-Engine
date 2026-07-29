@@ -1,0 +1,102 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_productivity_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: Team Lead - Productivity Rolled-up (3-Bucket Logic)
+   METRIC: Productivity (Weight: 15%, Target: 100%)
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_productivity_team_lead_detailed` AS
+
+  WITH Base_Calculations AS (
+    SELECT 
+      -- Dimensiones A hasta L
+      pk,
+      timestamp,
+      submitter_email,
+      report_month,
+      report_year,
+      tl_wdid,
+      tl_name,
+      tl_manager,
+      tl_sr_manager,
+      program,
+      country,
+      region,
+      
+      -- Datos base para el cálculo
+      audits_completed,
+      audits_required,
+      exempt,
+      exemption_reason,
+      notes,
+
+      -- Nuevas columnas estáticas y de configuración
+      'My Business' AS productivity_business_category,
+      'Productivity' AS productivity_kpi,
+      1.00 AS productivity_target, -- Target del 100%
+      
+      -- Columnas de soporte agregadas para el control de auditoria
+      'Yes' AS productivity_kpi_applicable,
+      IF(LOWER(TRIM(exempt)) = 'yes', 'Yes', 'No') AS productivity_exempt,
+      IF(LOWER(TRIM(exempt)) = 'yes', exemption_reason, NULL) AS productivity_reason,
+
+      -- Peso dinámico con lógica de exclusión (NULL si es exento)
+      IF(LOWER(TRIM(exempt)) = 'yes', NULL, 0.10) AS productivity_weight, -- Peso del 15%
+
+      -- Cálculo del porcentaje de productividad (Productivity PCT) con protección de exención y limpieza de comas
+      IF(LOWER(TRIM(exempt)) = 'yes', NULL, 
+        SAFE_DIVIDE(
+          CAST(REPLACE(audits_completed, ',', '') AS FLOAT64), 
+          CAST(REPLACE(audits_required, ',', '') AS FLOAT64)
+        )
+      ) AS productivity_pct
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qatl_productivity_raw`
+  ),
+
+  Categorization AS (
+    SELECT 
+      *,
+      -- Productivity Achievement Category (3 Buckets) protegido contra exenciones
+      CASE 
+        WHEN productivity_exempt = 'Yes' THEN NULL
+        WHEN productivity_pct < 0.90 THEN 'Improvement Required'
+        WHEN productivity_pct >= 0.90 AND productivity_pct < 1.00 THEN 'Developing'
+        WHEN productivity_pct >= 1.00 THEN 'Achieving'
+        ELSE 'N/A'
+      END AS productivity_achievement_category,
+
+      -- Productivity Points (1 a 3 puntos) protegido contra exenciones
+      CASE 
+        WHEN productivity_exempt = 'Yes' THEN NULL
+        WHEN productivity_pct < 0.90 THEN 1
+        WHEN productivity_pct >= 0.90 AND productivity_pct < 1.00 THEN 2
+        WHEN productivity_pct >= 1.00 THEN 3
+        ELSE 0
+      END AS productivity_points
+    FROM 
+      Base_Calculations
+  )
+
+  -- Selección Final con pesos obtenidos y score final
+  SELECT 
+    *,
+    -- productivity_weight_obtained: 33%, 66% o 100% del peso (0.15)
+    IF(productivity_exempt = 'Yes', NULL,
+      (CASE 
+        WHEN productivity_points = 1 THEN 0.3333
+        WHEN productivity_points = 2 THEN 0.6666
+        WHEN productivity_points = 3 THEN 1.0000
+        ELSE 0 
+      END) * productivity_weight) AS productivity_weight_obtained,
+
+    -- productivity_weight_final_score: Points * Weight (Normalizado a la escala del peso)
+    IF(productivity_exempt = 'Yes', NULL, productivity_points * productivity_weight) AS productivity_weight_final_score
+
+  FROM 
+    Categorization;
+
+  SELECT 'Roster updated: Productivity TL block with 3-bucket logic and 15% weight.' as status;
+
+END;
