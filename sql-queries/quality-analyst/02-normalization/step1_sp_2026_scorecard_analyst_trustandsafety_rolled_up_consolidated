@@ -1,0 +1,342 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_analyst_trustandsafety_rolled_up_consolidated`()
+BEGIN
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_analyst_trustandsafety_rolled_up_consolidated` AS
+
+WITH Analyst_Base AS (
+  SELECT
+    -- Metadata & Dimensions
+    timestamp,
+    SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+    'T&S Quality Analyst' AS role,
+    report_month,
+    report_year,
+    tl_wdid,
+    tl_name,
+    tl_manager,
+    tl_sr_manager,
+    tm_wdid, -- AJUSTE DE GRANULARIDAD: ID del Analista
+    tm_name, -- AJUSTE DE GRANULARIDAD: Nombre del Analista
+    program,
+    country,
+    region,
+
+    -- Productivity Metrics Inputs
+    SAFE_CAST(qa_evals_completed AS FLOAT64) AS qa_evals_completed,
+    SAFE_CAST(qa_evals_target AS FLOAT64) AS qa_evals_target,
+    SAFE_CAST(appeals_handled AS FLOAT64) AS appeals_handled,
+    SAFE_CAST(appeals_handled_target AS FLOAT64) AS appeals_handled_target,
+    SAFE_CAST(rca_handled AS FLOAT64) AS rca_handled,
+    SAFE_CAST(rca_target AS FLOAT64) AS rca_target,
+
+    -- Accepted Appeals Metrics Inputs
+    SAFE_CAST(aa_actual AS FLOAT64) AS aa_actual,
+    SAFE_CAST(aa_score_target_program AS FLOAT64) AS aa_score_target_program,
+
+    -- Quality Metrics Inputs
+    SAFE_CAST(quality_score_actual AS FLOAT64) AS quality_score_actual,
+    SAFE_CAST(quality_score_target_program AS FLOAT64) AS quality_score_target_program,
+
+    -- KPI Applicability & Exemption Flags
+    prod_kpi_applicable,
+    prod_exempt,
+    qa_evals_na,
+    appeals_na,
+    rca_na,
+    aa_kpi_applicable,
+    aa_exempt,
+    qa_kpi_applicable,
+    qa_exempt
+  FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+),
+
+/*-----------------------------------------------------------------------------------------------
+    1. METRIC LAYER: ACCEPTED APPEALS SCORING
+  -----------------------------------------------------------------------------------------------*/
+  Analyst_Appeals AS (
+    SELECT
+      *,
+      'My Customer' AS accepted_appeals_business_category, 
+      'Accepted Appeals % to Goal' AS accepted_appeals_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.25 
+      END AS accepted_appeals_weight_master,
+      0.975 AS accepted_appeals_target_master,
+      
+      -- Desempeño antes del objetivo programático
+      SAFE_DIVIDE(
+        aa_score_target_program - aa_actual, 
+        aa_score_target_program
+      ) AS accepted_appeals_performance_before_goal,
+      
+      -- Cálculo final de Performance to Goal (PTG) de Appeals
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(aa_score_target_program - aa_actual, aa_score_target_program) / 0.975 
+      END AS accepted_appeals_ptg
+    FROM Analyst_Base
+  ),
+
+  Analyst_Appeals_Scores AS (
+    SELECT
+      *,
+      -- Definición de Rangos de Logro (Tiers) de Appeals
+      CASE 
+        WHEN accepted_appeals_ptg IS NULL THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 'Improvement Required' 
+        WHEN accepted_appeals_ptg >= 0.85 AND accepted_appeals_ptg <= 0.9499 THEN 'Developing' 
+        WHEN accepted_appeals_ptg >= 0.95 AND accepted_appeals_ptg <= 0.9599 THEN 'Achieving' 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 'Excelling' 
+        ELSE NULL 
+      END AS accepted_appeals_achievement_tier,
+
+      -- Asignación de Puntos Basada en el Tier (Escala de 1 a 4)
+      CASE 
+        WHEN accepted_appeals_ptg IS NULL THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 1 
+        WHEN accepted_appeals_ptg >= 0.85 AND accepted_appeals_ptg <= 0.9499 THEN 2 
+        WHEN accepted_appeals_ptg >= 0.95 AND accepted_appeals_ptg <= 0.9599 THEN 3 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 4 
+        ELSE 0 
+      END AS accepted_appeals_points_obtained
+    FROM Analyst_Appeals
+  ),
+
+  Analyst_Appeals_Final AS (
+    SELECT
+      *,
+      -- Cálculos Finales de Peso Obtenido y Puntos de Scorecard
+      CASE 
+        WHEN accepted_appeals_points_obtained IS NULL THEN NULL 
+        ELSE (accepted_appeals_points_obtained / 4) * accepted_appeals_weight_master 
+      END AS accepted_appeals_weight_obtained,
+
+      CASE 
+        WHEN accepted_appeals_points_obtained IS NULL THEN NULL 
+        ELSE accepted_appeals_points_obtained * accepted_appeals_weight_master 
+      END AS accepted_appeals_points_final_score
+    FROM Analyst_Appeals_Scores
+  ),
+
+/*-----------------------------------------------------------------------------------------------
+    2. METRIC LAYER: QUALITY PERCENT TO GOAL SCORING
+  -----------------------------------------------------------------------------------------------*/
+  Analyst_Quality AS (
+    SELECT
+      *,
+      'My Customer' AS qaptg_business_category, 
+      'Quality % to Goal' AS qa_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS quality_weight_master,
+      
+      -- Cálculo del Porcentaje de Cumplimiento (PTG) de Calidad
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(quality_score_actual, quality_score_target_program) 
+      END AS quality_ptg
+    FROM Analyst_Appeals_Final
+  ),
+
+  Analyst_Quality_Scores AS (
+    SELECT
+      *,
+      -- Definición de Rangos de Logro (Tiers) de Calidad
+      CASE 
+        WHEN quality_ptg IS NULL THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN quality_ptg >= 0.90 AND quality_ptg <= 0.9999 THEN 'Developing' 
+        WHEN quality_ptg >= 1.00 AND quality_ptg <= 1.0099 THEN 'Achieving' 
+        WHEN quality_ptg >= 1.01 THEN 'Excelling' 
+        ELSE NULL 
+      END AS quality_achievement_tier,
+
+      -- Asignación de Puntos Basada en el Tier (Escala de 1 a 4)
+      CASE 
+        WHEN quality_ptg IS NULL THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 1 
+        WHEN quality_ptg >= 0.90 AND quality_ptg <= 0.9999 THEN 2 
+        WHEN quality_ptg >= 1.00 AND quality_ptg <= 1.0099 THEN 3 
+        WHEN quality_ptg >= 1.01 THEN 4 
+        ELSE 0 
+      END AS quality_points_obtained
+    FROM Analyst_Quality
+  ),
+
+  Analyst_Quality_Final AS (
+    SELECT
+      *,
+      -- Cálculos Finales de Peso Obtenido y Puntos de Scorecard
+      CASE 
+        WHEN quality_points_obtained IS NULL THEN NULL 
+        ELSE (quality_points_obtained / 4) * quality_weight_master 
+      END AS quality_weight_obtained,
+
+      CASE 
+        WHEN quality_points_obtained IS NULL THEN NULL 
+        ELSE quality_points_obtained * quality_weight_master 
+      END AS quality_points_final_score
+    FROM Analyst_Quality_Scores
+  ),
+
+/*-----------------------------------------------------------------------------------------------
+    3. METRIC LAYER: PRODUCTIVITY SCORING
+  -----------------------------------------------------------------------------------------------*/
+  Analyst_Productivity AS (
+    SELECT
+      *,
+      'My Business' AS productivity_business_category, 
+      'Productivity' AS productivity_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' OR UPPER(TRIM(prod_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS productivity_weight_master,
+      1.00 AS productivity_target_master,
+
+      -- Componente 1: Evaluations Performance to Goal (PTG)
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(prod_exempt)) = 'YES' 
+          OR UPPER(TRIM(qa_evals_na)) = 'NO' THEN NULL 
+        ELSE SAFE_DIVIDE(qa_evals_completed, qa_evals_target) 
+      END AS evals_ptg,
+
+      -- Componente 2: Appeals Performance to Goal (PTG)
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(prod_exempt)) = 'YES' 
+          OR UPPER(TRIM(appeals_na)) = 'NO' THEN NULL 
+        ELSE SAFE_DIVIDE(appeals_handled, appeals_handled_target) 
+      END AS appeals_ptg,
+
+      -- Componente 3: RPC Performance to Goal (PTG)
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(prod_exempt)) = 'YES' 
+          OR UPPER(TRIM(rca_na)) = 'NO' THEN NULL 
+        ELSE SAFE_DIVIDE(rca_handled, rca_target) 
+      END AS rpc_ptg
+    FROM Analyst_Quality_Final
+  ),
+
+  Analyst_Productivity_PTG AS (
+    SELECT
+      *,
+      -- Promedio dinámico considerando únicamente los componentes que NO son NULL
+      SAFE_DIVIDE(
+        (IFNULL(evals_ptg, 0) + IFNULL(appeals_ptg, 0) + IFNULL(rpc_ptg, 0)),
+        (
+          CASE WHEN evals_ptg IS NOT NULL THEN 1 ELSE 0 END + 
+          CASE WHEN appeals_ptg IS NOT NULL THEN 1 ELSE 0 END + 
+          CASE WHEN rpc_ptg IS NOT NULL THEN 1 ELSE 0 END
+        )
+      ) AS productivity_ptg
+    FROM Analyst_Productivity
+  ),
+
+  Analyst_Productivity_Scores AS (
+    SELECT
+      *,
+      -- Definición de Rangos de Logro (Tiers)
+      CASE 
+        WHEN productivity_ptg IS NULL THEN NULL 
+        WHEN productivity_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN productivity_ptg >= 0.90 AND productivity_ptg <= 0.9999 THEN 'Developing' 
+        WHEN productivity_ptg >= 1.00 THEN 'Achieving' 
+        ELSE NULL 
+      END AS productivity_achievement_tier,
+
+      -- Asignación de Puntos Basada en el Tier (Escala de 1 a 3)
+      CASE 
+        WHEN productivity_ptg IS NULL THEN NULL 
+        WHEN productivity_ptg < 0.90 THEN 1 
+        WHEN productivity_ptg >= 0.90 AND productivity_ptg <= 0.9999 THEN 2 
+        WHEN productivity_ptg >= 1.00 THEN 3 
+        ELSE 0 
+      END AS productivity_points_obtained
+    FROM Analyst_Productivity_PTG
+  ),
+
+  Analyst_Productivity_Final_Block AS (
+    SELECT
+      *,
+      -- Cálculos Finales de Peso Ganado y Puntos de Scorecard
+      CASE 
+        WHEN productivity_points_obtained IS NULL THEN NULL 
+        ELSE (productivity_points_obtained / 3) * productivity_weight_master 
+      END AS productivity_weight_earned,
+
+      CASE 
+        WHEN productivity_points_obtained IS NULL THEN NULL 
+        ELSE productivity_points_obtained * productivity_weight_master 
+      END AS productivity_points_final_score
+    FROM Analyst_Productivity_Scores
+  )
+
+SELECT 
+  -- Metadata & Dimensions
+  timestamp,
+  date,
+  report_month,
+  report_year,
+  role,
+  tl_wdid,
+  tl_name,
+  tl_manager,
+  tl_sr_manager,
+  tm_wdid, -- AJUSTE DE GRANULARIDAD: ID del Analista
+  tm_name, -- AJUSTE DE GRANULARIDAD: Nombre del Analista
+  program,
+  country,
+  region,
+
+  -- Accepted Appeals Block
+  accepted_appeals_business_category,
+  accepted_appeals_kpi,
+  aa_actual,
+  aa_score_target_program,
+  accepted_appeals_weight_master,
+  accepted_appeals_target_master,
+  accepted_appeals_performance_before_goal,
+  accepted_appeals_ptg,
+  accepted_appeals_achievement_tier,
+  accepted_appeals_points_obtained,
+  accepted_appeals_weight_obtained,
+  accepted_appeals_points_final_score,
+
+  -- Quality Block
+  qaptg_business_category,
+  qa_kpi,
+  quality_score_actual,
+  quality_score_target_program,
+  quality_weight_master,
+  quality_ptg,
+  quality_achievement_tier,
+  quality_points_obtained,
+  quality_weight_obtained,
+  quality_points_final_score,
+
+  -- Productivity Block
+  productivity_business_category,
+  productivity_kpi,
+  qa_evals_completed,
+  qa_evals_target,
+  appeals_handled,
+  appeals_handled_target,
+  rca_handled,
+  rca_target,
+  productivity_weight_master,
+  productivity_target_master,
+  productivity_ptg,
+  productivity_achievement_tier,
+  productivity_points_obtained,
+  productivity_weight_earned,
+  productivity_points_final_score
+
+FROM Analyst_Productivity_Final_Block;
+
+END;
