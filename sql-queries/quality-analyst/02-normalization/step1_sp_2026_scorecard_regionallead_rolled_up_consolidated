@@ -1,0 +1,205 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_regionallead_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: Regional Lead - Quality % to Goal Rolled-up (Grain: Region/Country/Leader/Program - Weight 15%)
+   DESCRIPTION: Consolidación total unificada de las verticales CX y T&S mediante UNION ALL.
+                Se sustituye la extracción sobre 'tl_sr_manager' por el mapeo oficial por País y Región
+                proveniente de `2026_regional_lead_mapping_raw`.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_ptg_regional_lead_detailed` AS
+  
+  WITH 
+  -- ==============================================================================================
+  -- MAPEO OFICIAL DE REGIONAL LEADS
+  -- ==============================================================================================
+  Mapping_Base AS (
+    SELECT DISTINCT
+      LOWER(TRIM(country)) AS country_clean,
+      LOWER(TRIM(region)) AS region_clean,
+      REGEXP_EXTRACT(regional_lead, r'\((\d+)\)') AS wdid_regional_lead,
+      TRIM(REGEXP_REPLACE(regional_lead, r'\s*\([^)]+\)', '')) AS regional_lead_name
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_regional_lead_mapping_raw`
+    WHERE regional_lead IS NOT NULL
+  ),
+
+  -- ==============================================================================================
+  -- VERTICAL 1: CUSTOMER EXPERIENCE (CX)
+  -- ==============================================================================================
+  RegionalBase_CX AS (
+    SELECT 
+      raw.*,
+      m.wdid_regional_lead,
+      m.regional_lead_name
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_quality_raw` AS raw
+    INNER JOIN Mapping_Base AS m
+      ON LOWER(TRIM(raw.country)) = m.country_clean
+     AND LOWER(TRIM(raw.region)) = m.region_clean
+    WHERE m.wdid_regional_lead IS NOT NULL
+  ),
+
+  CalculatedData_CX AS (
+    SELECT 
+      'CX and T&S Quality Regional Lead' AS role,
+      
+      -- Nueva columna 'timestamp' agregada sin alterar date
+      TIMESTAMP(COALESCE(
+        SAFE.PARSE_DATE('%b %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING))),
+        SAFE.PARSE_DATE('%B %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING))),
+        SAFE.PARSE_DATE('%m %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING)))
+      )) AS timestamp,
+      
+      -- Columna 'date' truncada al primer día del mes
+      COALESCE(
+        SAFE.PARSE_DATE('%b %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING))),
+        SAFE.PARSE_DATE('%B %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING))),
+        SAFE.PARSE_DATE('%m %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING)))
+      ) AS date,
+      
+      raw.report_month,
+      raw.report_year,
+      raw.wdid_regional_lead,
+      raw.regional_lead_name,
+      raw.region,
+      raw.country, 
+      raw.program, 
+      'CX' AS cost_center,                            -- Cost Center para CX
+      'My Customer' AS qaptg_business_category,       
+      'Quality % to Goal' AS qa_kpi,
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS qa_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0, 'No', 'Yes') AS qa_exempt,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0, 'Rolled up by Regional Lead, Country and Program', 'Exempt') AS qa_reason,
+      
+      -- Limpieza de porcentajes en formato de texto para CX
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN SAFE_CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64) ELSE NULL END))) AS quality_score_actual,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN SAFE_CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64) ELSE NULL END))) AS quality_score_target_program,
+      
+      CASE 
+        WHEN COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') > 0 AND COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0 THEN 0.15 
+        ELSE NULL 
+      END AS qa_weight,
+      SAFE_DIVIDE(
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN SAFE_CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN SAFE_CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+      ) AS _raw_calc
+    FROM RegionalBase_CX AS raw
+    -- Aumentado a 10 para abarcar la columna 'program' tras agregar 'timestamp'
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+  ),
+
+  -- ==============================================================================================
+  -- VERTICAL 2: TRUST & SAFETY (T&S)
+  -- ==============================================================================================
+  RegionalBase_TS AS (
+    SELECT 
+      raw.*,
+      m.wdid_regional_lead,
+      m.regional_lead_name
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw` AS raw
+    INNER JOIN Mapping_Base AS m
+      ON LOWER(TRIM(raw.country)) = m.country_clean
+     AND LOWER(TRIM(raw.region)) = m.region_clean
+    WHERE m.wdid_regional_lead IS NOT NULL
+  ),
+
+  CalculatedData_TS AS (
+    SELECT 
+      'CX and T&S Quality Regional Lead' AS role,
+      
+      -- Nueva columna 'timestamp' agregada sin alterar date
+      TIMESTAMP(COALESCE(
+        SAFE.PARSE_DATE('%b %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING))),
+        SAFE.PARSE_DATE('%B %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING))),
+        SAFE.PARSE_DATE('%m %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING)))
+      )) AS timestamp,
+      
+      -- Columna 'date' truncada al primer día del mes
+      COALESCE(
+        SAFE.PARSE_DATE('%b %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING))),
+        SAFE.PARSE_DATE('%B %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING))),
+        SAFE.PARSE_DATE('%m %Y', CONCAT(TRIM(raw.report_month), ' ', SAFE_CAST(raw.report_year AS STRING)))
+      ) AS date,
+      
+      raw.report_month,
+      raw.report_year,
+      raw.wdid_regional_lead,
+      raw.regional_lead_name,
+      raw.region,
+      raw.country, 
+      raw.program, 
+      'T&S' AS cost_center,                           -- Cost Center para T&S
+      'My Customer' AS qaptg_business_category,       
+      'Quality % to Goal' AS qa_kpi,
+      IF(COUNTIF(LOWER(TRIM(raw.qa_kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS qa_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(raw.qa_exempt)) = 'no') > 0, 'No', 'Yes') AS qa_exempt,
+      IF(COUNTIF(LOWER(TRIM(raw.qa_exempt)) = 'no') > 0, 'Rolled up by Regional Lead, Country and Program', 'Exempt') AS qa_reason,
+      
+      -- Procesamiento de decimales nativos para T&S (multiplicado por 100 para estandarizar visualización)
+      IF(COUNTIF(LOWER(TRIM(raw.qa_exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.qa_exempt)) = 'no' THEN SAFE_CAST(raw.quality_score_actual AS FLOAT64) ELSE NULL END) * 100)) AS quality_score_actual,
+      IF(COUNTIF(LOWER(TRIM(raw.qa_exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.qa_exempt)) = 'no' THEN SAFE_CAST(raw.quality_score_target_program AS FLOAT64) ELSE NULL END) * 100)) AS quality_score_target_program,
+      
+      CASE 
+        WHEN COUNTIF(LOWER(TRIM(raw.qa_kpi_applicable)) = 'yes') > 0 AND COUNTIF(LOWER(TRIM(raw.qa_exempt)) = 'no') > 0 THEN 0.15 
+        ELSE NULL 
+      END AS qa_weight,
+      SAFE_DIVIDE(
+        AVG(CASE WHEN LOWER(TRIM(raw.qa_exempt)) = 'no' THEN SAFE_CAST(raw.quality_score_actual AS FLOAT64) ELSE NULL END), 
+        AVG(CASE WHEN LOWER(TRIM(raw.qa_exempt)) = 'no' THEN SAFE_CAST(raw.quality_score_target_program AS FLOAT64) ELSE NULL END)
+      ) AS _raw_calc
+    FROM RegionalBase_TS AS raw
+    -- Aumentado a 10 para abarcar la columna 'program' tras agregar 'timestamp'
+    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+  ),
+
+  -- ==============================================================================================
+  -- CONSOLIDACIÓN TOTAL MEDIANTE UNION ALL
+  -- ==============================================================================================
+  UnifiedCalculatedData AS (
+    SELECT * FROM CalculatedData_CX
+    UNION ALL 
+    SELECT * FROM CalculatedData_TS
+  ),
+
+  -- 3. CTE: Creación de la columna unificada 'qa_ptg'
+  PtgBaseData AS (
+    SELECT 
+      * EXCEPT(_raw_calc),
+      IF(qa_exempt = 'Yes', NULL, _raw_calc) AS qa_ptg
+    FROM UnifiedCalculatedData
+  ),
+
+  -- 4. CTE: Recálculo de Categoría y Puntos basados en el rendimiento unificado de 'qa_ptg'
+  CategorizedAndPointsData AS (
+    SELECT 
+      *,
+      IF(qa_exempt = 'Yes', NULL,
+        CASE 
+          WHEN qa_ptg < 0.90 THEN 'Improvement Required'
+          WHEN qa_ptg >= 0.90 AND qa_ptg <= 0.9999 THEN 'Developing'
+          WHEN qa_ptg >= 1.00 AND qa_ptg <= 1.0099 THEN 'Achieving'
+          WHEN qa_ptg >= 1.01 THEN 'Excelling'
+          ELSE NULL 
+        END) AS achievement_category,
+      IF(qa_exempt = 'Yes', NULL,
+        CASE 
+          WHEN qa_ptg < 0.90 THEN 1
+          WHEN qa_ptg >= 0.90 AND qa_ptg <= 0.9999 THEN 2
+          WHEN qa_ptg >= 1.00 AND qa_ptg <= 1.0099 THEN 3
+          WHEN qa_ptg >= 1.01 THEN 4
+          ELSE NULL 
+        END) AS qa_points_obtained
+    FROM PtgBaseData
+  )
+
+  -- 5. Selección Final: Puntos finales y pesos calculados simétricamente para ambas líneas de negocio
+  SELECT 
+    *,
+    -- Conservado alias original con typo por compatibilidad: qa_weight_obtaiend
+    IF(qa_exempt = 'Yes', NULL, (qa_points_obtained * 0.25) * qa_weight) AS qa_weight_obtaiend,
+    
+    IF(qa_exempt = 'Yes', NULL, qa_points_obtained * qa_weight) AS qa_points_obtained_for_final_score_only
+  FROM 
+    CategorizedAndPointsData;
+
+END;
