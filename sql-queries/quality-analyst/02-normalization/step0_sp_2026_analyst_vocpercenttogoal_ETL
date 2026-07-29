@@ -1,0 +1,182 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_analyst_vocpercenttogoal_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: Quality Analyst - VOC % to Goal Mirror ETL (EXACT MIRROR OF QA STRUCTURE)
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_voc_ptg_quality_analyst_detailed` AS
+  
+  -- 1. CTE to calculate the total distinct programs per analyst, month, and year
+  WITH ProgramCounts AS (
+    SELECT 
+      tm_wdid, 
+      report_month, 
+      report_year, 
+      COUNT(DISTINCT program) AS final_total_programs
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qa_voc_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  CalculatedData AS (
+    SELECT 
+      'CX Quality Analyst' AS role,
+      raw.timestamp, 
+      raw.submitter_email,
+      raw.report_month,
+      raw.report_year,
+      raw.tl_wdid,
+      raw.tl_name,
+      raw.tl_manager,
+      raw.tl_sr_manager,
+      raw.tm_wdid,
+      raw.tm_name,
+      raw.program,
+      raw.country,
+      raw.region,
+      'My Customer' AS voc_business_category,
+      'VOC % to Goal' AS voc_kpi,
+      raw.notes AS voc_notes,
+      raw.kpi_applicable AS voc_kpi_applicable,
+      raw.exempt AS voc_exempt,
+      raw.reason AS voc_reason,
+      -- Scores reordered to match QA structure
+      raw.voc_score_actual,
+      raw.voc_score_target_program,
+      pc.final_total_programs,
+      -- Weight assignment (0.15 for VOC)
+      CASE 
+        WHEN UPPER(raw.kpi_applicable) = 'YES' AND UPPER(raw.exempt) = 'NO' THEN 0.15 
+        ELSE NULL 
+      END AS voc_weight,
+
+      -- Logic for voc_single_multi_program: mirrors qa_single_multi_program
+      SAFE_DIVIDE(
+        CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64), 
+        CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64)
+      ) AS voc_single_multi_program,
+
+      -- Logic for voc_single_program: calculated only if final_total_programs = 1
+      CASE 
+        WHEN pc.final_total_programs = 1 THEN
+          NULLIF(
+            SAFE_DIVIDE(
+              CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64), 
+              CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64)
+            ), 
+            0
+          )
+        ELSE NULL 
+      END AS voc_single_program,
+      
+      -- Internal calculation preserved for capping logic
+      NULLIF(
+        SAFE_DIVIDE(
+          CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64), 
+          CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64)
+        ), 
+        0
+      ) AS _raw_calc
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qa_voc_raw` AS raw
+    LEFT JOIN 
+      ProgramCounts AS pc 
+      ON raw.tm_wdid = pc.tm_wdid 
+      AND raw.report_month = pc.report_month 
+      AND raw.report_year = pc.report_year
+  ),
+
+  CappedData AS (
+    SELECT 
+      * EXCEPT(_raw_calc),
+      -- Logic for voc_multi_program: mirrors quality_multi_program
+      CASE 
+        WHEN final_total_programs >= 2 THEN
+          CASE 
+            WHEN _raw_calc <= 0.5000 THEN 0
+            WHEN _raw_calc > 0.5000 AND _raw_calc <= 0.8500 THEN 0.50
+            WHEN _raw_calc > 0.8501 AND _raw_calc <= 0.9599 THEN 0.75
+            WHEN _raw_calc >= 0.9600 AND _raw_calc <= 1.1499 THEN 1.00
+            WHEN _raw_calc >= 1.1500 THEN 1.1500
+            ELSE _raw_calc
+          END
+        ELSE NULL 
+      END AS voc_multi_program,
+      
+      -- Master Column: voc_perf_vs_cap_uncapped (mirrors qa_perf_vs_cap_uncapped)
+      COALESCE(voc_single_program, 
+               CASE 
+                 WHEN final_total_programs >= 2 THEN
+                   CASE 
+                     WHEN _raw_calc <= 0.5000 THEN 0
+                     WHEN _raw_calc > 0.5000 AND _raw_calc <= 0.8500 THEN 0.50
+                     WHEN _raw_calc > 0.8501 AND _raw_calc <= 0.9599 THEN 0.75
+                     WHEN _raw_calc >= 0.9600 AND _raw_calc <= 1.1499 THEN 1.00
+                     WHEN _raw_calc >= 1.1500 THEN 1.1500
+                     ELSE _raw_calc
+                   END
+                 ELSE NULL 
+               END) AS voc_perf_vs_cap_uncapped
+    FROM 
+      CalculatedData
+  ),
+
+  CategorizedAndPointsData AS (
+    SELECT
+      *,
+      -- Achievement Category using VOC specific thresholds (85/95/96)
+      CASE 
+        WHEN voc_perf_vs_cap_uncapped < 0.85 THEN 'Improvement Required'
+        WHEN voc_perf_vs_cap_uncapped >= 0.85 AND voc_perf_vs_cap_uncapped <= 0.9499 THEN 'Developing'
+        WHEN voc_perf_vs_cap_uncapped >= 0.95 AND voc_perf_vs_cap_uncapped <= 0.9599 THEN 'Achieving'
+        WHEN voc_perf_vs_cap_uncapped >= 0.96 THEN 'Excelling'
+        ELSE NULL 
+      END AS achievement_category,
+      
+      -- Points assignment (1-4 points)
+      CASE 
+        WHEN voc_perf_vs_cap_uncapped < 0.85 THEN 1
+        WHEN voc_perf_vs_cap_uncapped >= 0.85 AND voc_perf_vs_cap_uncapped <= 0.9499 THEN 2
+        WHEN voc_perf_vs_cap_uncapped >= 0.95 AND voc_perf_vs_cap_uncapped <= 0.9599 THEN 3
+        WHEN voc_perf_vs_cap_uncapped >= 0.96 THEN 4
+        ELSE NULL 
+      END AS voc_points_obtained
+    FROM 
+      CappedData
+  )
+
+  SELECT 
+    *,
+    
+    
+    -- Quarters logic for weight obtained
+    CASE 
+      WHEN achievement_category = 'Improvement Required' THEN voc_weight * 0.25
+      WHEN achievement_category = 'Developing' THEN voc_weight * 0.50
+      WHEN achievement_category = 'Achieving' THEN voc_weight * 0.75
+      WHEN achievement_category = 'Excelling' THEN voc_weight * 1.00
+      ELSE NULL 
+    END AS voc_weight_obtaiend,
+
+
+    -- New Column: Weight obtained diluted by program
+    (CASE 
+      WHEN achievement_category = 'Improvement Required' THEN voc_weight * 0.25
+      WHEN achievement_category = 'Developing' THEN voc_weight * 0.50
+      WHEN achievement_category = 'Achieving' THEN voc_weight * 0.75
+      WHEN achievement_category = 'Excelling' THEN voc_weight * 1.00
+      ELSE NULL 
+    END) * SAFE_DIVIDE(1.0, final_total_programs) AS voc_weight_obtaiend_program_diluted,
+  
+  
+    -- Workload distribution and final metrics
+    --SAFE_DIVIDE(1.0, final_total_programs) AS voc_program_weight_final,
+    --voc_perf_vs_cap_uncapped * SAFE_DIVIDE(1.0, final_total_programs) AS voc_ptg_final_cap_diluted_rows,
+
+    -- Final weighted calculations
+    voc_points_obtained * voc_weight AS voc_points_obtained_for_final_score_only,
+  FROM 
+    CategorizedAndPointsData;
+
+END;
