@@ -1,0 +1,230 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_manager_trustandsafety_acceptedappeals_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: Trust & Safety Manager & Sr Manager - Accepted Appeals % to Goal Rolled-up (Weight 15%)
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_manager_trustandsafety_acceptedappeals_ETL` AS
+
+  -- ==============================================================================================
+  -- BRANCH 1: MANAGER (100% INTACT ORIGINAL LOGIC)
+  -- ==============================================================================================
+  WITH Manager_Appeals_Source AS (
+    SELECT
+      MAX(timestamp) AS timestamp,
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      report_month,
+      report_year,
+      tl_manager,
+      tl_sr_manager,
+      program,
+      country,
+      region,
+      
+      -- Protection against mixed populations: ignore exempt or non-applicable individual analysts
+      SUM(CASE WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(aa_actual AS FLOAT64) END) AS aa_actual,
+      SUM(CASE WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(aa_score_target_program AS FLOAT64) END) AS aa_score_target_program,
+      
+      -- Conditional flags: Manager exempt only if 100% of team is exempt
+      IF(COUNTIF(UPPER(TRIM(aa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS aa_kpi_applicable,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS aa_exempt,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), 'Whole roll-up team exempt', NULL) AS aa_notes,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), MAX(aa_reason), NULL) AS aa_reason
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+    GROUP BY report_month, report_year, tl_manager, tl_sr_manager, program, country, region
+  ),
+
+  Manager_Appeals_PTG AS (
+    SELECT
+      *,
+      'My Customer' AS accepted_appeals_business_category,
+      'Accepted Appeals % to Goal' AS accepted_appeals_kpi,
+      0.975 AS accepted_appeals_target,
+      
+      -- Master weight inherits clean exemption from previous block
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.15 
+      END AS accepted_appeals_weight_master,
+      
+      -- Performance before dividing by master goal
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL
+        ELSE SAFE_DIVIDE(aa_score_target_program - aa_actual, aa_score_target_program)
+      END AS accepted_appeals_performance_before_goal,
+      
+      -- Final percentage to goal (PTG) indexed to target (0.975)
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(aa_score_target_program - aa_actual, aa_score_target_program) / 0.975 
+      END AS accepted_appeals_ptg
+    FROM Manager_Appeals_Source
+  ),
+
+  Manager_Appeals_Scores AS (
+    SELECT
+      *,
+      -- Achievement tier classification
+      CASE 
+        WHEN accepted_appeals_ptg IS NULL THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 'Improvement Required' 
+        WHEN accepted_appeals_ptg >= 0.85 AND accepted_appeals_ptg <= 0.9499 THEN 'Developing' 
+        WHEN accepted_appeals_ptg >= 0.95 AND accepted_appeals_ptg <= 0.9599 THEN 'Achieving' 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 'Excelling' 
+        ELSE NULL 
+      END AS accepted_appeals_achievement_tier,
+      
+      -- Matrix points obtained
+      CASE 
+        WHEN accepted_appeals_ptg IS NULL THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 1 
+        WHEN accepted_appeals_ptg >= 0.85 AND accepted_appeals_ptg <= 0.9499 THEN 2 
+        WHEN accepted_appeals_ptg >= 0.95 AND accepted_appeals_ptg <= 0.9599 THEN 3 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 4 
+        ELSE 0 
+      END AS accepted_appeals_points_obtained
+    FROM Manager_Appeals_PTG
+  ),
+
+  Manager_Appeals_Block AS (
+    SELECT
+      timestamp,
+      date,
+      report_month,
+      report_year,
+      tl_manager,
+      tl_sr_manager,
+      program,
+      country,
+      region,
+      accepted_appeals_business_category,
+      accepted_appeals_kpi,
+      aa_actual,
+      aa_score_target_program,
+      accepted_appeals_weight_master,
+      accepted_appeals_target,
+      accepted_appeals_performance_before_goal,
+      accepted_appeals_ptg,
+      accepted_appeals_achievement_tier,
+      accepted_appeals_points_obtained,
+      CASE WHEN accepted_appeals_points_obtained IS NULL THEN NULL ELSE (accepted_appeals_points_obtained / 4) * accepted_appeals_weight_master END AS accepted_appeals_weight_obtained,
+      CASE WHEN accepted_appeals_points_obtained IS NULL THEN NULL ELSE accepted_appeals_points_obtained * accepted_appeals_weight_master END AS accepted_appeals_points_final_score,
+      aa_notes,
+      aa_kpi_applicable,
+      aa_exempt,
+      aa_reason
+    FROM Manager_Appeals_Scores
+  ),
+
+  -- ==============================================================================================
+  -- BRANCH 2: SENIOR MANAGER (RE-MAPPED MIRROR LOGIC FROM RAW SOURCE)
+  -- ==============================================================================================
+  SrManager_Appeals_Source AS (
+    SELECT
+      MAX(timestamp) AS timestamp,
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      report_month,
+      report_year,
+      tl_sr_manager AS tl_manager, -- Re-mapping Senior Manager to tl_manager
+      program,
+      country,
+      region,
+      
+      SUM(CASE WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(aa_actual AS FLOAT64) END) AS aa_actual,
+      SUM(CASE WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(aa_score_target_program AS FLOAT64) END) AS aa_score_target_program,
+      
+      IF(COUNTIF(UPPER(TRIM(aa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS aa_kpi_applicable,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS aa_exempt,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), 'Whole roll-up team exempt', NULL) AS aa_notes,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), MAX(aa_reason), NULL) AS aa_reason
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+    WHERE tl_sr_manager IS NOT NULL AND TRIM(tl_sr_manager) != ''
+    GROUP BY report_month, report_year, tl_sr_manager, program, country, region
+  ),
+
+  SrManager_Appeals_PTG AS (
+    SELECT
+      *,
+      'My Customer' AS accepted_appeals_business_category,
+      'Accepted Appeals % to Goal' AS accepted_appeals_kpi,
+      0.975 AS accepted_appeals_target,
+      
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.15 
+      END AS accepted_appeals_weight_master,
+      
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL
+        ELSE SAFE_DIVIDE(aa_score_target_program - aa_actual, aa_score_target_program)
+      END AS accepted_appeals_performance_before_goal,
+      
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(aa_score_target_program - aa_actual, aa_score_target_program) / 0.975 
+      END AS accepted_appeals_ptg
+    FROM SrManager_Appeals_Source
+  ),
+
+  SrManager_Appeals_Scores AS (
+    SELECT
+      *,
+      CASE 
+        WHEN accepted_appeals_ptg IS NULL THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 'Improvement Required' 
+        WHEN accepted_appeals_ptg >= 0.85 AND accepted_appeals_ptg <= 0.9499 THEN 'Developing' 
+        WHEN accepted_appeals_ptg >= 0.95 AND accepted_appeals_ptg <= 0.9599 THEN 'Achieving' 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 'Excelling' 
+        ELSE NULL 
+      END AS accepted_appeals_achievement_tier,
+      
+      CASE 
+        WHEN accepted_appeals_ptg IS NULL THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 1 
+        WHEN accepted_appeals_ptg >= 0.85 AND accepted_appeals_ptg <= 0.9499 THEN 2 
+        WHEN accepted_appeals_ptg >= 0.95 AND accepted_appeals_ptg <= 0.9599 THEN 3 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 4 
+        ELSE 0 
+      END AS accepted_appeals_points_obtained
+    FROM SrManager_Appeals_PTG
+  ),
+
+  SrManager_Appeals_Block AS (
+    SELECT
+      timestamp,
+      date,
+      report_month,
+      report_year,
+      tl_manager,
+      CAST(NULL AS STRING) AS tl_sr_manager, -- Blank for Senior Manager hierarchy level
+      program,
+      country,
+      region,
+      accepted_appeals_business_category,
+      accepted_appeals_kpi,
+      aa_actual,
+      aa_score_target_program,
+      accepted_appeals_weight_master,
+      accepted_appeals_target,
+      accepted_appeals_performance_before_goal,
+      accepted_appeals_ptg,
+      accepted_appeals_achievement_tier,
+      accepted_appeals_points_obtained,
+      CASE WHEN accepted_appeals_points_obtained IS NULL THEN NULL ELSE (accepted_appeals_points_obtained / 4) * accepted_appeals_weight_master END AS accepted_appeals_weight_obtained,
+      CASE WHEN accepted_appeals_points_obtained IS NULL THEN NULL ELSE accepted_appeals_points_obtained * accepted_appeals_weight_master END AS accepted_appeals_points_final_score,
+      aa_notes,
+      aa_kpi_applicable,
+      aa_exempt,
+      aa_reason
+    FROM SrManager_Appeals_Scores
+  )
+
+  -- ==============================================================================================
+  -- FINAL UNION
+  -- ==============================================================================================
+  SELECT * FROM Manager_Appeals_Block
+  UNION ALL
+  SELECT * FROM SrManager_Appeals_Block;
+
+END;
