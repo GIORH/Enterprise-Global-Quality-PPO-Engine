@@ -1,0 +1,179 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_analyst_qualitypecenttogoal_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: Quality Analyst - Quality % to Goal Mirror ETL (EXACT MIRROR OF VOC)
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_ptg_quality_analyst_detailed` AS
+  
+  -- 1. CTE to calculate the total distinct programs per analyst, month, and year [cite: 49, 50]
+  WITH ProgramCounts AS (
+    SELECT 
+      tm_wdid, 
+      report_month, 
+      report_year, 
+      COUNT(DISTINCT program) AS final_total_programs
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qa_quality_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  CalculatedData AS (
+    SELECT 
+      'CX Quality Analyst' AS role,
+      raw.timestamp, 
+      raw.submitter_email,
+      raw.report_month,
+      raw.report_year,
+      raw.tl_wdid,
+      raw.tl_name,
+      raw.tl_manager,
+      raw.tl_sr_manager,
+      raw.tm_wdid,
+      raw.tm_name,
+      raw.program,
+      raw.country,
+      raw.region,
+      'My Customer' AS qaptg_business_category,
+      'Quality % to Goal' AS qa_kpi,
+      raw.notes AS qa_notes,
+      raw.kpi_applicable AS qa_kpi_applicable,
+      raw.exempt AS qa_exempt,
+      raw.reason AS qa_reason,
+      -- Scores reordered: after reason and before final_total_programs [cite: 51]
+      raw.quality_score_actual,
+      raw.quality_score_target_program,
+      pc.final_total_programs,
+      -- Weight assignment (0.20 for Quality) [cite: 51]
+      CASE 
+        WHEN UPPER(raw.kpi_applicable) = 'YES' AND UPPER(raw.exempt) = 'NO' THEN 0.20 
+        ELSE NULL 
+      END AS qa_weight,
+
+      -- Logic for qa_single_multi_program: This will be quality_score_actual / quality_score_target_program for all people with single program and multi program
+
+            SAFE_DIVIDE(
+              CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64), 
+              CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64)
+            ) AS qa_single_multi_program,
+
+
+      -- Logic for qa_ptg_initial: calculated only if final_total_programs = 1 [cite: 52]
+      CASE 
+        WHEN pc.final_total_programs = 1 THEN
+          NULLIF(
+            SAFE_DIVIDE(
+              CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64), 
+              CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64)
+            ), 
+            0
+          )
+        ELSE NULL 
+      END AS qa_single_program,
+      -- Internal calculation preserved for capping logic [cite: 52]
+      NULLIF(
+        SAFE_DIVIDE(
+          CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64), 
+          CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64)
+        ), 
+        0
+      ) AS _raw_calc
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qa_quality_raw` AS raw
+    LEFT JOIN 
+      ProgramCounts AS pc 
+      ON raw.tm_wdid = pc.tm_wdid 
+      AND raw.report_month = pc.report_month 
+      AND raw.report_year = pc.report_year
+  ),
+
+  CappedData AS (
+    SELECT 
+      * EXCEPT(_raw_calc),
+      -- Logic for quality_ptg_cap_adjusted: calculated only if final_total_programs >= 2 [cite: 53, 54]
+      CASE 
+        WHEN final_total_programs >= 2 THEN
+          CASE 
+            WHEN _raw_calc <= 0.5000 THEN 0
+            WHEN _raw_calc > 0.5000 AND _raw_calc <= 0.8500 THEN 0.50
+            WHEN _raw_calc > 0.8501 AND _raw_calc <= 0.9999 THEN 0.75
+            WHEN _raw_calc >= 1.0000 AND _raw_calc <= 1.1499 THEN 1.00
+            WHEN _raw_calc >= 1.1500 THEN 1.1500
+            ELSE _raw_calc
+          END
+        ELSE NULL 
+      END AS quality_multi_program,
+      -- Master Column: qa_perf_vs_goal_semi_final (COALESCE as in VOC query) 
+      COALESCE(qa_single_program, 
+               CASE 
+                 WHEN final_total_programs >= 2 THEN
+                   CASE 
+                     WHEN _raw_calc <= 0.5000 THEN 0
+                     WHEN _raw_calc > 0.5000 AND _raw_calc <= 0.8500 THEN 0.50
+                     WHEN _raw_calc > 0.8501 AND _raw_calc <= 0.9999 THEN 0.75
+                     WHEN _raw_calc >= 1.0000 AND _raw_calc <= 1.1499 THEN 1.00
+                     WHEN _raw_calc >= 1.1500 THEN 1.1500
+                     ELSE _raw_calc
+                   END
+                 ELSE NULL 
+               END) AS qa_perf_vs_cap_uncapped
+    FROM 
+      CalculatedData
+  ),
+
+  CategorizedAndPointsData AS (
+    SELECT
+      *,
+      -- Achievement Category using QA specific thresholds (90/100/101) [cite: 55, 56]
+      CASE 
+        WHEN qa_perf_vs_cap_uncapped < 0.90 THEN 'Improvement Required'
+        WHEN qa_perf_vs_cap_uncapped >= 0.90 AND qa_perf_vs_cap_uncapped <= 0.9999 THEN 'Developing'
+        WHEN qa_perf_vs_cap_uncapped >= 1.00 AND qa_perf_vs_cap_uncapped <= 1.0099 THEN 'Achieving'
+        WHEN qa_perf_vs_cap_uncapped >= 1.01 THEN 'Excelling'
+        ELSE NULL 
+      END AS achievement_category,
+      -- Points assignment (1-4 points) [cite: 56, 57]
+      CASE 
+        WHEN qa_perf_vs_cap_uncapped < 0.90 THEN 1
+        WHEN qa_perf_vs_cap_uncapped >= 0.90 AND qa_perf_vs_cap_uncapped <= 0.9999 THEN 2
+        WHEN qa_perf_vs_cap_uncapped >= 1.00 AND qa_perf_vs_cap_uncapped <= 1.0099 THEN 3
+        WHEN qa_perf_vs_cap_uncapped >= 1.01 THEN 4
+        ELSE NULL 
+      END AS qa_points_obtained
+    FROM 
+      CappedData
+  )
+
+  SELECT 
+    *,
+    -- Quarters logic for weight obtained [cite: 57, 58]
+    CASE 
+      WHEN achievement_category = 'Improvement Required' THEN qa_weight * 0.25
+      WHEN achievement_category = 'Developing' THEN qa_weight * 0.50
+      WHEN achievement_category = 'Achieving' THEN qa_weight * 0.75
+      WHEN achievement_category = 'Excelling' THEN qa_weight * 1.00
+      ELSE NULL 
+    END AS qa_weight_obtaiend,
+
+
+    -- New Column: Weight obtained diluted by program
+    (CASE 
+      WHEN achievement_category = 'Improvement Required' THEN qa_weight * 0.25
+      WHEN achievement_category = 'Developing' THEN qa_weight * 0.50
+      WHEN achievement_category = 'Achieving' THEN qa_weight * 0.75
+      WHEN achievement_category = 'Excelling' THEN qa_weight * 1.00
+      ELSE NULL 
+    END) * SAFE_DIVIDE(1.0, final_total_programs) AS qa_weight_obtaiend_program_diluted,
+  
+  
+    -- Workload distribution and final metrics [cite: 58]
+    --SAFE_DIVIDE(1.0, final_total_programs) AS qa_program_weight_final,
+    --qa_perf_vs_cap_uncapped * SAFE_DIVIDE(1.0, final_total_programs) AS qa_ptg_final_cap_diluted_rows,
+
+    -- Final weighted calculations [cite: 57, 58]
+    qa_points_obtained * qa_weight AS qa_points_obtained_for_final_score_only,
+  FROM 
+    CategorizedAndPointsData;
+
+END;
