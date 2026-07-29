@@ -1,0 +1,135 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.a_sp_2026_enrich_roster_with_all_scores`()
+BEGIN
+
+  /* ======================================================================================
+   * PROCEDURE: 2026 Enrich Roster - Unified ETL & Leadership KPI Block (Strict May Filter)
+   * DESCRIPTION: 
+   * 1. Extracts hierarchy IDs using a greedy regex to capture the LAST parentheses (ID).
+   * 2. Creates a composite key (Employee_ID, Month, Year) restricted strictly to May.
+   * 3. Integrates Leadership results and applies Waterfall logic for scores.
+   * 4. Regroups and flattens data into a June 2026 target demographic format.
+   * ====================================================================================== */
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.global_qa_roster_with_scores` AS
+  
+  WITH 
+  -- STEP 1: Process Roster with DISTINCT and Regex for WDIDs (Strict May Filter)
+  Roster_Base AS (
+    SELECT DISTINCT 
+        * EXCEPT(employee_id, full_name, sr_manager, month, year),
+        employee_id AS Employee_ID,
+        full_name AS Full_Name,
+        sr_manager AS Sr_Manager,
+        month AS Month,
+        year AS Year,
+        -- Improved regex: captures the content of the LAST set of parentheses
+        REGEXP_EXTRACT(immediate_supervisor, r'.*\(([^)]+)\)') AS supervisor_wdid,
+        REGEXP_EXTRACT(sr_manager, r'.*\(([^)]+)\)') AS manager_wdid,
+        REGEXP_EXTRACT(sr_manager_department_head, r'.*\(([^)]+)\)') AS sr_manager_wdid
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_historical_qa_global_roster_proposal_raw`
+    WHERE employee_id IS NOT NULL 
+      AND LOWER(TRIM(month)) = 'may' -- Strict filter applied to limit processing exclusively to May
+  ),
+
+  -- STEP 2: Clean April 2026 Leadership Survey results
+  Clean_Leadership AS (
+      SELECT 
+          TRIM(REGEXP_EXTRACT(Leader, r'.*\(([^)]+)\)')) AS tid_str,
+          SAFE_CAST(REPLACE(NULLIF(apr_26, '-'), '%', '') AS FLOAT64) / 100 AS lead_score
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_leadership_survey_results`
+      WHERE Leader IS NOT NULL
+  ),
+
+  -- STEP 3: Waterfall Logic and Composite Key Creation
+  Waterfall_Calculated AS (
+    SELECT 
+        r.*,
+        -- KEY: Employee_ID + Month + Year (Positioned after sr_manager_wdid)
+        CONCAT(CAST(r.Employee_ID AS STRING), '_', r.Month, '_', CAST(r.Year AS STRING)) AS roster_key,
+        l_e.lead_score AS employee_leadership_score,
+        l_s.lead_score AS supervisor_leadership_score,
+        l_m.lead_score AS manager_leadership_score,
+        l_sm.lead_score AS sr_manager_leadership_score,
+        COALESCE(l_e.lead_score, l_s.lead_score, l_m.lead_score, l_sm.lead_score) AS leadership_ptg
+    FROM Roster_Base AS r
+    LEFT JOIN Clean_Leadership AS l_e ON CAST(r.Employee_ID AS STRING) = l_e.tid_str
+    LEFT JOIN Clean_Leadership AS l_s ON CAST(r.supervisor_wdid AS STRING) = l_s.tid_str
+    LEFT JOIN Clean_Leadership AS l_m ON CAST(r.manager_wdid AS STRING) = l_m.tid_str
+    LEFT JOIN Clean_Leadership AS l_sm ON CAST(r.sr_manager_wdid AS STRING) = l_sm.tid_str
+  ),
+
+  -- STEP 4: Category Assignment
+  Final_Calculations AS (
+    SELECT 
+        *,
+        'My Team' AS leadership_business_category,
+        'yearly_evaluations_leadership' AS leadership_kpi,
+        '10%' AS leadership_weight,
+        '100%' AS leadership_target,
+        
+        CASE 
+          WHEN leadership_ptg < 0.90 THEN 'Improvement Required'
+          WHEN leadership_ptg >= 0.90 AND leadership_ptg < 1.00 THEN 'Developing'
+          WHEN leadership_ptg >= 1.00 AND leadership_ptg < 1.01 THEN 'Achieving'
+          WHEN leadership_ptg >= 1.01 THEN 'Excelling'
+          ELSE 'N/A'
+        END AS leadership_achievement_category
+    FROM Waterfall_Calculated
+  ),
+
+  -- STEP 5: Enclosed Point Mapping and Weighted Scores into a CTE
+  Final_Scored_Roster AS (
+    SELECT 
+        *,
+        -- Points obtained (1-4)
+        CASE 
+          WHEN leadership_achievement_category = 'Improvement Required' THEN 1
+          WHEN leadership_achievement_category = 'Developing' THEN 2
+          WHEN leadership_achievement_category = 'Achieving' THEN 3
+          WHEN leadership_achievement_category = 'Excelling' THEN 4
+          ELSE 0
+        END AS leadership_points_obtained,
+
+        -- Weight obtained (Calculated in quarters)
+        (CASE 
+          WHEN leadership_achievement_category = 'Improvement Required' THEN 1
+          WHEN leadership_achievement_category = 'Developing' THEN 2
+          WHEN leadership_achievement_category = 'Achieving' THEN 3
+          WHEN leadership_achievement_category = 'Excelling' THEN 4
+          ELSE 0
+        END / 4.0) * 0.10 AS leadership_weight_obtained,
+
+        -- Final points score
+        (CASE 
+          WHEN leadership_achievement_category = 'Improvement Required' THEN 1
+          WHEN leadership_achievement_category = 'Developing' THEN 2
+          WHEN leadership_achievement_category = 'Achieving' THEN 3
+          WHEN leadership_achievement_category = 'Excelling' THEN 4
+          ELSE 0
+        END) * 0.10 AS leadership_points_final_score
+    FROM Final_Calculations
+  ),
+
+  -- STEP 6: Regroup and Re-arrange Columns for Target June Output Format
+  Regrouped_Leadership AS (
+    SELECT
+        DATE '2026-06-01' AS timestamp,                -- Short Date format typed column
+        'Jun' AS report_month,                          -- June hardcoded month
+        2026 AS report_year,                            -- 2026 hardcoded year
+        Employee_ID,                                    -- Leader unique Employee identifier
+        Full_Name,                                      -- Preserved original Full Name
+        leadership_ptg                                  -- Leadership percentage score
+    FROM Final_Scored_Roster
+    GROUP BY 
+        Employee_ID, 
+        Full_Name, 
+        leadership_ptg                                  -- Aggregates cleanly to 1 horizontal row per leader
+  )
+
+  -- FINAL SELECTION
+  SELECT * FROM Regrouped_Leadership;
+  
+  -- Status message updated to confirm clean schema regrouping execution
+  SELECT 'Roster updated: Data regrouped into June format, hierarchy strings removed from final output, and table rewritten.' as status;
+
+END;
