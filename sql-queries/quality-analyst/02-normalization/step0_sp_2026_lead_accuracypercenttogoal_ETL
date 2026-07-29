@@ -1,0 +1,103 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_accuracypercenttogoal_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: Team Lead - Accuracy % to Goal Rolled-up (Fixing Type Mismatch)
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_team_lead_detailed` AS
+  
+  -- 1. CTE: Conteo de programas (Cast a STRING para el Join posterior)
+  WITH ProgramCounts AS (
+    SELECT 
+      CAST(tl_wdid AS STRING) as tl_wdid, 
+      CAST(report_month AS STRING) as report_month, 
+      CAST(report_year AS STRING) as report_year, 
+      COUNT(DISTINCT program) AS final_total_programs
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  -- 2. CTE: Agregaciones (Cast de llaves a STRING para consistencia)
+  AggregatedData AS (
+    SELECT 
+      'CX Quality Team Lead and Sr Team lead' AS role,
+      MAX(timestamp) AS timestamp,
+      MAX(submitter_email) AS submitter_email,
+      CAST(report_month AS STRING) as report_month,
+      CAST(report_year AS STRING) as report_year,
+      CAST(tl_wdid AS STRING) as tl_wdid,
+      tl_name,
+      ANY_VALUE(tl_manager) AS tl_manager,
+      ANY_VALUE(tl_sr_manager) AS tl_sr_manager,
+      program,
+      country,
+      region,
+      'My Business' as accuracy_business_category,
+      'Accuracy % to Goal' as accuracy_kpi,
+      
+      -- Nuevas columnas de soporte para el Roll-up de estados
+      IF(COUNTIF(LOWER(TRIM(kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS accuracy_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(exempt)) = 'no') > 0, 'No', 'Yes') AS accuracy_exempt,
+      MAX(CASE WHEN LOWER(TRIM(exempt)) = 'yes' THEN reason ELSE NULL END) AS accuracy_reason,
+      
+      -- Agregaciones cuantitativas filtrando analistas exentos para proteger el Roll-up
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN cal_accurate ELSE NULL END) as cal_accurate,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN cal_performed ELSE NULL END) as cal_performed,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN valid_disputes ELSE NULL END) as valid_disputes,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN total_completed_evals ELSE NULL END) as total_completed_evals,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN accurate_evals ELSE NULL END) as accurate_evals,
+
+      AVG(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(REPLACE(accuracy_pct_to_goal, '%', '') AS FLOAT64) ELSE NULL END) / 100 as _accuracy_score_avg
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_analyst_detailed`
+    GROUP BY 4,5,6,7,10,11,12
+  ),
+
+  -- 3. CTE: Unión y Cálculo de Puntos
+  CalculatedLevels AS (
+    SELECT 
+      ad.*,
+      pc.final_total_programs,
+      0.95 as accuracy_target_master,
+      IF(ad.accuracy_exempt = 'Yes', NULL, 0.10) as accuracy_weight_master,
+      
+      IF(ad.accuracy_exempt = 'Yes', NULL, FORMAT("%.2f%%", ad._accuracy_score_avg * 100)) as accuracy_pct_to_goal,
+
+      IF(ad.accuracy_exempt = 'Yes', NULL, 
+        CASE 
+          WHEN ad._accuracy_score_avg < 0.90 THEN 1
+          WHEN ad._accuracy_score_avg < 0.95 THEN 2
+          WHEN ad._accuracy_score_avg < 0.96 THEN 3
+          ELSE 4
+        END) as accuracy_points_obtained
+    FROM AggregatedData ad
+    LEFT JOIN ProgramCounts pc 
+      ON ad.tl_wdid = pc.tl_wdid 
+      AND ad.report_month = pc.report_month 
+      AND ad.report_year = pc.report_year
+  )
+
+  -- 4. SELECT Final: Lógica de Cuartas Partes y Dilución
+  SELECT 
+    * EXCEPT(_accuracy_score_avg),
+    
+    CASE 
+      WHEN accuracy_exempt = 'Yes' THEN NULL
+      WHEN accuracy_points_obtained = 1 THEN 'Improvement Required'
+      WHEN accuracy_points_obtained = 2 THEN 'Developing'
+      WHEN accuracy_points_obtained = 3 THEN 'Achieving'
+      ELSE 'Excelling'
+    END as accuracy_achievement_category,
+
+    -- Puntos para Score Final (Puntos * Peso Maestro)
+    IF(accuracy_exempt = 'Yes', NULL, SAFE_CAST(accuracy_points_obtained * 0.10 AS FLOAT64)) as accuracy_points_obtained_for_final_score_only,
+
+    -- Peso Ganado (Simple: Peso Maestro * % según puntos)
+    IF(accuracy_exempt = 'Yes', NULL, FORMAT("%.2f%%", (0.10 * (accuracy_points_obtained * 0.25)) * 100)) as accuracy_earned_weight,
+
+    -- Peso Diluido (Peso Logrado / Cantidad de Programas)
+    IF(accuracy_exempt = 'Yes', NULL, (0.10 * (accuracy_points_obtained * 0.25)) * SAFE_DIVIDE(1.0, final_total_programs)) as accuracy_weight_diluted
+
+  FROM CalculatedLevels;
+
+END;
