@@ -1,3 +1,8 @@
+Range: 'Coaching'!A2:Q
+Table Name: 2026_cx_qamnr_coaching_raw
+Rows to skip: 1
+
+Schema:
 timestamp:STRING,
 submitter_email:STRING,
 report_month:STRING,
