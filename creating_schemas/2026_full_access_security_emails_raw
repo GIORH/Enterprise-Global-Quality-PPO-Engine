@@ -1,0 +1,8 @@
+Range: 'Full Access Roster'!A2:D
+Table Name: 2026_quality_team_scorecard_full_access_roster_raw
+Rows to skip: 1
+Schema:
+name:STRING,
+prefix:STRING,
+telus_digital_email:STRING,
+telus_international_email:STRING
