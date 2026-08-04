@@ -1,0 +1,27 @@
+Range: 'TS_QA_TL_Productivity'!A2:W
+Table Name: 2026_global_ts_qa_tl_productivity_raw
+Rows to skip: 1
+Schema:
+pk:STRING,
+timestamp:STRING,
+submitter_email:STRING,
+report_month:STRING,
+report_year:STRING,
+tl_wdid:STRING,
+tl_name:STRING,
+tl_manager:STRING,
+tl_sr_manager:STRING,
+program:STRING,
+country:STRING,
+region:STRING,
+qa_count:STRING,
+ts_calibrations_completed:STRING,
+ts_calibrations_required:STRING,
+ts_evals_completed:STRING,
+ts_evals_target:STRING,
+qa_cal_na:STRING,
+qa_evals_na:STRING,
+qa_cal_exempt:STRING,
+qa_evals_exempt:STRING,
+ts_exemption_reason:STRING,
+notes:STRING
