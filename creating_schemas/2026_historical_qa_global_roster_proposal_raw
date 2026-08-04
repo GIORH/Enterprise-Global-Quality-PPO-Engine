@@ -1,0 +1,27 @@
+Range: 'Historical QA Global Roster Proposal'!A2:W
+Table Name: 2026_historical_qa_global_roster_proposal_raw
+Rows to skip: 1
+Schema:
+geo:STRING,
+employee_id:STRING,
+full_name:STRING,
+immediate_supervisor:STRING,
+sr_manager:STRING,
+sr_manager_department_head:STRING,
+job_profile:STRING,
+cost_center:STRING,
+functional_area:STRING,
+work_style:STRING,
+email_primary_work:STRING,
+country:STRING,
+location:STRING,
+year:STRING,
+month:STRING,
+region:STRING,
+hire_date:STRING,
+inmediate_supervisor_1_email:STRING,
+inmediate_supervisor_2_email:STRING,
+inmediate_supervisor_3_email:STRING,
+inmediate_supervisor_4_email:STRING,
+inmediate_supervisor_5_email:STRING,
+inmediate_supervisor_6_email:STRING
