@@ -1,0 +1,15 @@
+Range: 'Sheet1'!A2:K
+Table Name: 2026_leadership_survey_results
+Rows to skip: 1
+Schema:
+leader:STRING,
+invites:STRING,
+responses:STRING,
+completion:STRING,
+april_2026:STRING,
+april_2025:STRING,
+diff_prev_survey:STRING,
+cost_center:STRING,
+category:STRING,
+month:STRING,
+year:STRING
