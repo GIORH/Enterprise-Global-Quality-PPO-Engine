@@ -1,0 +1,21 @@
+Range: 'Coaching'!A2:Q
+Table Name: 2026_cx_qatl_coaching_raw
+Rows to skip: 1
+Schema:
+timestamp:STRING,
+submitter_email:STRING,
+report_month:STRING,
+report_year:STRING,
+mngr_wdid:STRING,
+mngr_name:STRING,
+mngr_manager:STRING,
+mngr_sr_manager:STRING,
+tl_wdid:STRING,
+tl_name:STRING,
+country:STRING,
+region:STRING,
+coachings_performed:STRING,
+coachings_target:STRING,
+notes:STRING,
+exempt:STRING,
+exempt_reason:STRING
