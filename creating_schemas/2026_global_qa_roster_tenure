@@ -1,0 +1,23 @@
+Range: 'Global_QA_Roster'!A2:S
+Table Name: 2026_global_qa_roster_tenure
+Rows to skip: 1
+Schema:
+geo:STRING,
+employee_id:STRING,
+full_name:STRING,
+immediate_supervisor:STRING,
+sr_manager:STRING,
+sr_manager_department_head:STRING,
+job_profile:STRING,
+cost_center:STRING,
+functional_area:STRING,
+work_style:STRING,
+email_primary_work:STRING,
+country:STRING,
+location:STRING,
+performance_unit:STRING,
+performance_unit_hierarchy:STRING,
+region:STRING,
+hire_date:STRING,
+last_promotion_date:STRING,
+current_tenure_m:STRING
