@@ -1,0 +1,31 @@
+Range: 'Accuracy % to Goal'!A2:AA
+Table Name: 2026_qa_accuracy_raw
+Rows to skip: 1
+Schema:
+timestamp:STRING,
+submitter_email:STRING,
+report_month:STRING,
+report_year:STRING,
+tl_wdid:STRING,
+tl_name:STRING,
+tl_manager:STRING,
+tl_sr_manager:STRING,
+tm_wdid:STRING,
+tm_name:STRING,
+program:STRING,
+country:STRING,
+region:STRING,
+cal_accurate:STRING,
+cal_performed:STRING,
+valid_disputes:STRING,
+total_completed_evals:STRING,
+accurate_evals:STRING,
+notes:STRING,
+kpi_applicable:STRING,
+exempt:STRING,
+reason:STRING,
+calibrations_na:STRING,
+disputes_na:STRING,
+audits_na:STRING,
+accuracy_applicable_components_count:STRING,
+key:STRING
