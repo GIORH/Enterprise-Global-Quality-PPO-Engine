@@ -1,0 +1,23 @@
+Range: 'PPD'!A2:S
+Table Name: 2026_qa_ppd_raw
+Rows to skip: 1
+Schema:
+timestamp:STRING,
+submitter_email:STRING,
+report_month:STRING,
+report_year:STRING,
+tl_wdid:STRING,
+tl_name:STRING,
+tl_manager:STRING,
+tl_sr_manager:STRING,
+tm_wdid:STRING,
+tm_name:STRING,
+program:STRING,
+country:STRING,
+region:STRING,
+courses_completed:STRING,
+courses_required:STRING,
+notes:STRING,
+kpi_applicable:STRING,
+exempt:STRING,
+reason:STRING
