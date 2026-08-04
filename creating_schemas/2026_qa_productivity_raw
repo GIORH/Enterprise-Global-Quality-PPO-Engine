@@ -1,0 +1,32 @@
+Range: 'Productivity'!A2:AB
+Table Name: 2026_qa_productivity_raw
+Rows to skip: 1
+Schema:
+timestamp:STRING,
+submitter_email:STRING,
+report_month:STRING,
+report_year:STRING,
+tl_wdid:STRING,
+tl_name:STRING,
+tl_manager:STRING,
+tl_sr_manager:STRING,
+tm_wdid:STRING,
+tm_name:STRING,
+program:STRING,
+country:STRING,
+region:STRING,
+qa_evals_completed:STRING,
+qa_evals_target:STRING,
+voc_evals_completed:STRING,
+voc_evals_target:STRING,
+calibrations_completed:STRING,
+calibrations_target:STRING,
+notes:STRING,
+kpi_applicable:STRING,
+exempt:STRING,
+reason:STRING,
+qa_evals_na:STRING,
+voc_na:STRING,
+calibrations_na:STRING,
+productivity_applicable_components_count:STRING,
+key:STRING
