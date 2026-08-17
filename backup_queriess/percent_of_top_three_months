@@ -1,0 +1,389 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.a_a_sp_2026_potp_all_roles_ETL`()
+BEGIN
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_potp_all_roles_etl_output` AS
+
+  WITH 
+    /* ========================================================================= */
+    /* --- BLOQUE 0: LOOKUP DE PROMOCIONES Y TRUNCADO AL 1° DEL SIGUIENTE MES -- */
+    /* ========================================================================= */
+    promotions_lookup AS (
+      SELECT 
+        REGEXP_REPLACE(TRIM(CAST(employee_id AS STRING)), r'\.0$', '') AS employee_id_std,
+        -- Trunca la fecha de promoción exactamente al primer día del siguiente mes
+        DATE_TRUNC(
+          DATE_ADD(
+            COALESCE(
+              SAFE.PARSE_DATE('%m/%d/%Y', CAST(last_promotion_date AS STRING)),
+              SAFE.PARSE_DATE('%Y-%m-%d', CAST(last_promotion_date AS STRING)),
+              SAFE_CAST(last_promotion_date AS DATE)
+            ), 
+            INTERVAL 1 MONTH
+          ), 
+          MONTH
+        ) AS grace_start_date
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_global_qa_roster_tenure`
+      WHERE last_promotion_date IS NOT NULL 
+        AND TRIM(CAST(last_promotion_date AS STRING)) NOT IN ('', '-', 'NULL')
+      QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY REGEXP_REPLACE(TRIM(CAST(employee_id AS STRING)), r'\.0$', '')
+        ORDER BY last_promotion_date DESC
+      ) = 1
+    ),
+
+    /* ========================================================================= */
+    /* --- BLOQUE 1: CX ANALYST TO CX QUALITY TEAM LEAD ----------------------- */
+    /* ========================================================================= */
+    analyst_monthly_roll AS (
+      SELECT 
+        SAFE_CAST(tm_wdid AS STRING) as tm_wdid,
+        SAFE_CAST(tl_wdid AS STRING) as tl_wdid,
+        LOWER(TRIM(report_month)) as month,
+        SAFE_CAST(report_year AS STRING) as year,
+        IFNULL(NULLIF(TRIM(program), ''), 'No Program') as program, 
+        IFNULL(NULLIF(TRIM(region), ''), 'No Region') as region,
+        IFNULL(NULLIF(TRIM(country), ''), 'No Country') as country,
+        ANY_VALUE(TRIM(tl_name)) as tl_name,
+        SUM(final_score_points_obtained) as total_obtained,
+        SUM(max_final_score_points_available) as total_available
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_analyst_consolidated`
+      WHERE tl_wdid IS NOT NULL
+      GROUP BY tm_wdid, tl_wdid, month, year, program, region, country
+    ),
+
+    analyst_global_tier AS (
+      SELECT 
+        *,
+        CASE 
+          WHEN SAFE_DIVIDE(total_obtained, total_available) IS NULL THEN NULL
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.50 THEN 'Improvement Required'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.75 THEN 'Developing'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.87 THEN 'Achieving'
+          ELSE 'Excelling'
+        END AS global_tier
+      FROM analyst_monthly_roll
+    ),
+
+    tl_potp_base AS (
+      SELECT 
+        a.tl_wdid AS inmediate_supervisor_id,
+        a.month,
+        a.year,
+        a.program, 
+        a.region,
+        a.country,
+        ANY_VALUE(a.tl_name) as inmediate_supervisor_name,
+        COUNT(DISTINCT IF(a.global_tier IN ('Excelling', 'Achieving'), a.tm_wdid, NULL)) AS count_top_performers,
+        COUNT(DISTINCT a.tm_wdid) AS count_total
+      FROM analyst_global_tier a
+      LEFT JOIN promotions_lookup p 
+        ON REGEXP_REPLACE(TRIM(CAST(a.tm_wdid AS STRING)), r'\.0$', '') = p.employee_id_std
+      WHERE p.grace_start_date IS NULL 
+         OR DATE_DIFF(SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(a.month, 1, 3)), ' ', a.year)), p.grace_start_date, MONTH) NOT BETWEEN 0 AND 2
+      GROUP BY inmediate_supervisor_id, month, year, program, region, country
+    ),
+
+    /* ========================================================================= */
+    /* --- BLOQUE 2: T&S ANALYST TO T&S QUALITY TEAM LEAD --------------------- */
+    /* ========================================================================= */
+    ts_analyst_monthly_roll AS (
+      SELECT 
+        SAFE_CAST(tm_wdid AS STRING) as tm_wdid,
+        SAFE_CAST(tl_wdid AS STRING) as tl_wdid,
+        LOWER(TRIM(report_month)) as month,
+        SAFE_CAST(report_year AS STRING) as year,
+        IFNULL(NULLIF(TRIM(program), ''), 'No Program') as program, 
+        IFNULL(NULLIF(TRIM(region), ''), 'No Region') as region,
+        IFNULL(NULLIF(TRIM(country), ''), 'No Country') as country,
+        ANY_VALUE(TRIM(tl_name)) as tl_name,
+        SUM(final_score_points_obtained) as total_obtained,
+        SUM(max_final_score_points_available) as total_available
+      FROM `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_quality_analyst_trustandsafety_consolidated`
+      WHERE tl_wdid IS NOT NULL
+      GROUP BY tm_wdid, tl_wdid, month, year, program, region, country
+    ),
+
+    ts_analyst_global_tier AS (
+      SELECT 
+        *,
+        CASE 
+          WHEN SAFE_DIVIDE(total_obtained, total_available) IS NULL THEN NULL
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.50 THEN 'Improvement Required'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.75 THEN 'Developing'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.87 THEN 'Achieving'
+          ELSE 'Excelling'
+        END AS global_tier
+      FROM ts_analyst_monthly_roll
+    ),
+
+    ts_tl_potp_base AS (
+      SELECT 
+        a.tl_wdid AS inmediate_supervisor_id,
+        a.month,
+        a.year,
+        a.program, 
+        a.region,
+        a.country,
+        ANY_VALUE(a.tl_name) as inmediate_supervisor_name,
+        COUNT(DISTINCT IF(a.global_tier IN ('Excelling', 'Achieving'), a.tm_wdid, NULL)) AS count_top_performers,
+        COUNT(DISTINCT a.tm_wdid) AS count_total
+      FROM ts_analyst_global_tier a
+      LEFT JOIN promotions_lookup p 
+        ON REGEXP_REPLACE(TRIM(CAST(a.tm_wdid AS STRING)), r'\.0$', '') = p.employee_id_std
+      WHERE p.grace_start_date IS NULL 
+         OR DATE_DIFF(SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(a.month, 1, 3)), ' ', a.year)), p.grace_start_date, MONTH) NOT BETWEEN 0 AND 2
+      GROUP BY inmediate_supervisor_id, month, year, program, region, country
+    ),
+
+    /* ========================================================================= */
+    /* --- BLOQUE 3: CX TEAM LEAD TO CX QUALITY MANAGER ----------------------- */
+    /* ========================================================================= */
+    cx_tl_monthly_roll AS (
+      SELECT 
+        SAFE_CAST(tl_wdid AS STRING) as tl_wdid,
+        LOWER(TRIM(report_month)) as month,
+        SAFE_CAST(report_year AS STRING) as year,
+        IFNULL(NULLIF(TRIM(program), ''), 'No Program') as program, 
+        IFNULL(NULLIF(TRIM(region), ''), 'No Region') as region,
+        IFNULL(NULLIF(TRIM(country), ''), 'No Country') as country,
+        ANY_VALUE(TRIM(tl_manager)) as raw_manager_string,
+        SUM(final_score_points_obtained) as total_obtained,
+        SUM(max_final_score_points_available) as total_available
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_team_lead_consolidated`
+      GROUP BY tl_wdid, month, year, program, region, country
+    ),
+
+    cx_tl_global_tier AS (
+      SELECT 
+        *,
+        CASE 
+          WHEN SAFE_DIVIDE(total_obtained, total_available) IS NULL THEN NULL
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.50 THEN 'Improvement Required'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.75 THEN 'Developing'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.87 THEN 'Achieving'
+          ELSE 'Excelling'
+        END AS global_tier,
+        REGEXP_EXTRACT(raw_manager_string, r'\((\d+)\)\s*$') as manager_wdid,
+        TRIM(REGEXP_REPLACE(raw_manager_string, r'\s*\(\d+\)\s*$', '')) as manager_name
+      FROM cx_tl_monthly_roll
+    ),
+
+    cx_manager_potp_base AS (
+      SELECT 
+        a.manager_wdid AS inmediate_supervisor_id,
+        a.month,
+        a.year,
+        a.program, 
+        a.region,
+        a.country,
+        ANY_VALUE(a.manager_name) as inmediate_supervisor_name,
+        COUNT(DISTINCT IF(a.global_tier IN ('Excelling', 'Achieving'), a.tl_wdid, NULL)) AS count_top_performers,
+        COUNT(DISTINCT a.tl_wdid) AS count_total
+      FROM cx_tl_global_tier a
+      LEFT JOIN promotions_lookup p 
+        ON REGEXP_REPLACE(TRIM(CAST(a.tl_wdid AS STRING)), r'\.0$', '') = p.employee_id_std
+      WHERE a.manager_wdid IS NOT NULL
+        AND (p.grace_start_date IS NULL 
+             OR DATE_DIFF(SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(a.month, 1, 3)), ' ', a.year)), p.grace_start_date, MONTH) NOT BETWEEN 0 AND 2)
+      GROUP BY inmediate_supervisor_id, month, year, program, region, country
+    ),
+
+    /* ========================================================================= */
+    /* --- BLOQUE 4: T&S TEAM LEAD TO T&S QUALITY MANAGER --------------------- */
+    /* ========================================================================= */
+    ts_tl_monthly_roll AS (
+      SELECT 
+        SAFE_CAST(tl_wdid AS STRING) as tl_wdid,
+        LOWER(TRIM(report_month)) as month,
+        SAFE_CAST(report_year AS STRING) as year,
+        IFNULL(NULLIF(TRIM(program), ''), 'No Program') as program, 
+        IFNULL(NULLIF(TRIM(region), ''), 'No Region') as region,
+        IFNULL(NULLIF(TRIM(country), ''), 'No Country') as country,
+        ANY_VALUE(TRIM(tl_manager)) as raw_manager_string,
+        SUM(final_score_points_obtained) as total_obtained,
+        SUM(max_final_score_points_available) as total_available
+      FROM `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_qa_team_lead_trustandsafety_consolidated`
+      GROUP BY tl_wdid, month, year, program, region, country
+    ),
+
+    ts_tl_global_tier AS (
+      SELECT 
+        *,
+        CASE 
+          WHEN SAFE_DIVIDE(total_obtained, total_available) IS NULL THEN NULL
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.50 THEN 'Improvement Required'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.75 THEN 'Developing'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.87 THEN 'Achieving'
+          ELSE 'Excelling'
+        END AS global_tier,
+        REGEXP_EXTRACT(raw_manager_string, r'\((\d+)\)\s*$') as manager_wdid,
+        TRIM(REGEXP_REPLACE(raw_manager_string, r'\s*\(\d+\)\s*$', '')) as manager_name
+      FROM ts_tl_monthly_roll
+    ),
+
+    ts_manager_potp_base AS (
+      SELECT 
+        a.manager_wdid AS inmediate_supervisor_id,
+        a.month,
+        a.year,
+        a.program, 
+        a.region,
+        a.country,
+        ANY_VALUE(a.manager_name) as inmediate_supervisor_name,
+        COUNT(DISTINCT IF(a.global_tier IN ('Excelling', 'Achieving'), a.tl_wdid, NULL)) AS count_top_performers,
+        COUNT(DISTINCT a.tl_wdid) AS count_total
+      FROM ts_tl_global_tier a
+      LEFT JOIN promotions_lookup p 
+        ON REGEXP_REPLACE(TRIM(CAST(a.tl_wdid AS STRING)), r'\.0$', '') = p.employee_id_std
+      WHERE a.manager_wdid IS NOT NULL
+        AND (p.grace_start_date IS NULL 
+             OR DATE_DIFF(SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(a.month, 1, 3)), ' ', a.year)), p.grace_start_date, MONTH) NOT BETWEEN 0 AND 2)
+      GROUP BY inmediate_supervisor_id, month, year, program, region, country
+    ),
+
+    /* ========================================================================= */
+    /* --- BLOQUE 5: T&S MANAGER TO T&S DIRECTOR / SR MANAGER ----------------- */
+    /* ========================================================================= */
+    ts_mgr_monthly_roll AS (
+      SELECT 
+        SAFE_CAST(manager_wdid AS STRING) as manager_wdid,
+        LOWER(TRIM(report_month)) as month,
+        SAFE_CAST(report_year AS STRING) as year,
+        IFNULL(NULLIF(TRIM(program), ''), 'No Program') as program, 
+        IFNULL(NULLIF(TRIM(region), ''), 'No Region') as region,
+        IFNULL(NULLIF(TRIM(country), ''), 'No Country') as country,
+        ANY_VALUE(TRIM(tl_sr_manager)) as raw_director_string,
+        SUM(final_score_points_obtained) as total_obtained,
+        SUM(max_final_score_points_available) as total_available
+      FROM `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_qa_manager_trustandsafety_consolidated`
+      WHERE manager_wdid IS NOT NULL
+      GROUP BY manager_wdid, month, year, program, region, country
+    ),
+
+    ts_mgr_global_tier AS (
+      SELECT 
+        *,
+        CASE 
+          WHEN SAFE_DIVIDE(total_obtained, total_available) IS NULL THEN NULL
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.50 THEN 'Improvement Required'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.75 THEN 'Developing'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.87 THEN 'Achieving'
+          ELSE 'Excelling'
+        END AS global_tier,
+        REGEXP_EXTRACT(raw_director_string, r'\((\d+)\)\s*$') as director_wdid,
+        TRIM(REGEXP_REPLACE(raw_director_string, r'\s*\(\d+\)\s*$', '')) as director_name
+      FROM ts_mgr_monthly_roll
+    ),
+
+    ts_director_potp_base AS (
+      SELECT 
+        a.director_wdid AS inmediate_supervisor_id,
+        a.month,
+        a.year,
+        a.program, 
+        a.region,
+        a.country,
+        ANY_VALUE(a.director_name) as inmediate_supervisor_name,
+        COUNT(DISTINCT IF(a.global_tier IN ('Excelling', 'Achieving'), a.manager_wdid, NULL)) AS count_top_performers,
+        COUNT(DISTINCT a.manager_wdid) AS count_total
+      FROM ts_mgr_global_tier a
+      LEFT JOIN promotions_lookup p 
+        ON REGEXP_REPLACE(TRIM(CAST(a.manager_wdid AS STRING)), r'\.0$', '') = p.employee_id_std
+      WHERE a.director_wdid IS NOT NULL
+        AND (p.grace_start_date IS NULL 
+             OR DATE_DIFF(SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(a.month, 1, 3)), ' ', a.year)), p.grace_start_date, MONTH) NOT BETWEEN 0 AND 2)
+      GROUP BY inmediate_supervisor_id, month, year, program, region, country
+    ),
+
+    /* ========================================================================= */
+    /* --- BLOQUE 6: CX MANAGER TO CX DIRECTOR / SR MANAGER ------------------- */
+    /* ========================================================================= */
+    cx_mgr_monthly_roll AS (
+      SELECT 
+        SAFE_CAST(manager_wdid AS STRING) as manager_wdid,
+        LOWER(TRIM(report_month)) as month,
+        SAFE_CAST(report_year AS STRING) as year,
+        IFNULL(NULLIF(TRIM(program), ''), 'No Program') as program, 
+        IFNULL(NULLIF(TRIM(region), ''), 'No Region') as region,
+        IFNULL(NULLIF(TRIM(country), ''), 'No Country') as country,
+        ANY_VALUE(TRIM(tl_sr_manager)) as raw_director_string,
+        SUM(final_score_points_obtained) as total_obtained,
+        SUM(max_final_score_points_available) as total_available
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_manager_consolidated`
+      WHERE manager_wdid IS NOT NULL
+      GROUP BY manager_wdid, month, year, program, region, country
+    ),
+
+    cx_mgr_global_tier AS (
+      SELECT 
+        *,
+        CASE 
+          WHEN SAFE_DIVIDE(total_obtained, total_available) IS NULL THEN NULL
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.50 THEN 'Improvement Required'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.75 THEN 'Developing'
+          WHEN SAFE_DIVIDE(total_obtained, total_available) < 0.87 THEN 'Achieving'
+          ELSE 'Excelling'
+        END AS global_tier,
+        REGEXP_EXTRACT(raw_director_string, r'\((\d+)\)\s*$') as director_wdid,
+        TRIM(REGEXP_REPLACE(raw_director_string, r'\s*\(\d+\)\s*$', '')) as director_name
+      FROM cx_mgr_monthly_roll
+    ),
+
+    cx_director_potp_base AS (
+      SELECT 
+        a.director_wdid AS inmediate_supervisor_id,
+        a.month,
+        a.year,
+        a.program, 
+        a.region,
+        a.country,
+        ANY_VALUE(a.director_name) as inmediate_supervisor_name,
+        COUNT(DISTINCT IF(a.global_tier IN ('Excelling', 'Achieving'), a.manager_wdid, NULL)) AS count_top_performers,
+        COUNT(DISTINCT a.manager_wdid) AS count_total
+      FROM cx_mgr_global_tier a
+      LEFT JOIN promotions_lookup p 
+        ON REGEXP_REPLACE(TRIM(CAST(a.manager_wdid AS STRING)), r'\.0$', '') = p.employee_id_std
+      WHERE a.director_wdid IS NOT NULL
+        AND (p.grace_start_date IS NULL 
+             OR DATE_DIFF(SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(a.month, 1, 3)), ' ', a.year)), p.grace_start_date, MONTH) NOT BETWEEN 0 AND 2)
+      GROUP BY inmediate_supervisor_id, month, year, program, region, country
+    ),
+
+    /* ========================================================================= */
+    /* --- UNION ALL DE DATOS CRUDOS INCLUYENDO REGION Y COUNTRY -------------- */
+    /* ========================================================================= */
+    raw_union_data AS (
+      SELECT 'CX Analyst' AS from_source, SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(month, 1, 3)), ' ', year)) AS date, inmediate_supervisor_id, inmediate_supervisor_name, month, year, program, region, country, count_top_performers, count_total FROM tl_potp_base
+      UNION ALL
+      SELECT 'T&S Analyst' AS from_source, SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(month, 1, 3)), ' ', year)) AS date, inmediate_supervisor_id, inmediate_supervisor_name, month, year, program, region, country, count_top_performers, count_total FROM ts_tl_potp_base
+      UNION ALL
+      SELECT 'CX Team Lead' AS from_source, SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(month, 1, 3)), ' ', year)) AS date, inmediate_supervisor_id, inmediate_supervisor_name, month, year, program, region, country, count_top_performers, count_total FROM cx_manager_potp_base
+      UNION ALL
+      SELECT 'T&S Team Lead' AS from_source, SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(month, 1, 3)), ' ', year)) AS date, inmediate_supervisor_id, inmediate_supervisor_name, month, year, program, region, country, count_top_performers, count_total FROM ts_manager_potp_base
+      UNION ALL
+      SELECT 'T&S Manager' AS from_source, SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(month, 1, 3)), ' ', year)) AS date, inmediate_supervisor_id, inmediate_supervisor_name, month, year, program, region, country, count_top_performers, count_total FROM ts_director_potp_base
+      UNION ALL
+      SELECT 'CX Manager' AS from_source, SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(month, 1, 3)), ' ', year)) AS date, inmediate_supervisor_id, inmediate_supervisor_name, month, year, program, region, country, count_top_performers, count_total FROM cx_director_potp_base
+    )
+
+  /* ========================================================================= */
+  /* --- WRAPPER FINAL: UNICIDAD CORPORATIVA TOTAL --------------------------- */
+  /* ========================================================================= */
+  SELECT 
+    STRING_AGG(DISTINCT from_source, ', ') AS from_source, 
+    ANY_VALUE(date) AS date,
+    inmediate_supervisor_id,
+    inmediate_supervisor_name,
+    month,
+    year,
+    program,
+    region,
+    country,
+    SUM(count_top_performers) AS count_top_performers,
+    SUM(count_total) AS count_total,
+    0.90 AS target_master,
+    SAFE_DIVIDE(SUM(count_top_performers), SUM(count_total)) AS potp_ptg
+  FROM raw_union_data
+  GROUP BY inmediate_supervisor_id, inmediate_supervisor_name, month, year, program, region, country;
+
+END;
