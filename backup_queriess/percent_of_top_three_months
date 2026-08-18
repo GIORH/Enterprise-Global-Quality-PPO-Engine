@@ -1,3 +1,6 @@
+--This is the 3 months % of top performers backup query
+
+
 CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.a_a_sp_2026_potp_all_roles_ETL`()
 BEGIN
 
