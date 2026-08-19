@@ -1,0 +1,133 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_analyst_productivity_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_analyst_productivity_ETL
+   DESCRIPTION: Master ETL pipeline for the Quality Analyst 'Productivity' KPI (20% Weight).
+                This procedure standardizes raw completed vs. target volumes across three
+                operational pillars (QA Evaluations, VOC Evaluations, and Calibrations).
+                It dynamically calculates the applicable component count, computes individual
+                completion rates, and aggregates a final Percentage to Goal. Performance is 
+                then evaluated against a customized 3-point tier scale to assign scorecard weights.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_productivity_analyst_detailed` AS
+  
+  WITH 
+    /* =========================================================================================
+       CTE 1: DATA SANITIZATION & TYPE CASTING
+       Extracts the raw productivity dataset and casts comma-separated string values into 
+       FLOAT64 numerical formats to enable precise mathematical ratio calculations.
+    ========================================================================================= */
+    base AS (
+      SELECT 
+        *,
+        SAFE_CAST(REPLACE(CAST(qa_evals_completed AS STRING), ',', '') AS FLOAT64) as n_qa_comp,
+        SAFE_CAST(REPLACE(CAST(qa_evals_target AS STRING), ',', '') AS FLOAT64) as n_qa_target,
+        SAFE_CAST(REPLACE(CAST(voc_evals_completed AS STRING), ',', '') AS FLOAT64) as n_voc_comp,
+        SAFE_CAST(REPLACE(CAST(voc_evals_target AS STRING), ',', '') AS FLOAT64) as n_voc_target,
+        SAFE_CAST(REPLACE(CAST(calibrations_completed AS STRING), ',', '') AS FLOAT64) as n_cal_comp,
+        SAFE_CAST(REPLACE(CAST(calibrations_target AS STRING), ',', '') AS FLOAT64) as n_cal_target
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_productivity_raw`
+      WHERE tm_wdid IS NOT NULL
+    ),
+
+    /* =========================================================================================
+       CTE 2: APPLICABILITY LOGIC & INDIVIDUAL COMPLETION RATES
+       Identifies which of the three productivity pillars apply to the analyst for the current 
+       month (v_z). Calculates the completion ratio for each applicable pillar, safely defaulting 
+       to 0 to prevent division-by-zero errors when no target is assigned.
+    ========================================================================================= */
+    logic AS (
+      SELECT 
+        *,
+        -- Count of applicable operational pillars
+        (CASE WHEN UPPER(TRIM(qa_evals_na)) = 'YES' THEN 1 ELSE 0 END + 
+         CASE WHEN UPPER(TRIM(voc_na)) = 'YES' THEN 1 ELSE 0 END + 
+         CASE WHEN UPPER(TRIM(calibrations_na)) = 'YES' THEN 1 ELSE 0 END) AS v_z,
+        
+        -- Individual pillar performance calculation
+        IF(n_qa_target = 0, 0, n_qa_comp / n_qa_target) as v_qa_c,
+        IF(n_voc_target = 0, 0, n_voc_comp / n_voc_target) as v_voc_c,
+        IF(n_cal_target = 0, 0, n_cal_comp / n_cal_target) as v_cal_c
+      FROM base
+    ),
+
+    /* =========================================================================================
+       CTE 3: CONSOLIDATED SCORE DERIVATION
+       Aggregates the individual pillar ratios and divides by the total number of applicable 
+       components (v_z) to generate the final, unrounded productivity score. Exemptions and 
+       inapplicable KPIs evaluate to NULL.
+    ========================================================================================= */
+    final_math AS (
+      SELECT 
+        *,
+        -- Unified productivity score calculation
+        CASE 
+          WHEN UPPER(TRIM(kpi_applicable)) <> 'YES' OR UPPER(TRIM(exempt)) = 'YES' OR v_z = 0 THEN NULL 
+          ELSE SAFE_DIVIDE((COALESCE(v_qa_c, 0) + COALESCE(v_voc_c, 0) + COALESCE(v_cal_c, 0)), v_z) 
+        END AS v_score
+      FROM logic
+    )
+
+  /* =========================================================================================
+     FINAL OUTPUT: SCORECARD MAPPING, FORMATTING & TIERING
+     Formats the calculated ratios into standardized percentage strings. Evaluates the final 
+     productivity score against a customized 3-tier scale (Improvement Required, Developing, 
+     Achieving) and assigns the resulting metric points, tier status, and diluted weights.
+  ========================================================================================= */
+  SELECT 
+    f.timestamp, f.submitter_email, f.report_month, f.report_year, f.tl_wdid, f.tl_name, f.tl_manager, f.tl_sr_manager, f.tm_wdid, f.tm_name, f.program, f.country, f.region,
+    f.qa_evals_completed, f.qa_evals_target, f.voc_evals_completed, f.voc_evals_target, f.calibrations_completed, f.calibrations_target,
+    f.notes, f.kpi_applicable, f.exempt, f.reason, f.qa_evals_na, f.voc_na, f.calibrations_na,
+
+    'CX Quality Analyst' as role,
+    'My Business' as productivity_business_category,
+    'Productivity' as kpi,
+    IF(UPPER(TRIM(f.kpi_applicable)) = 'NO' OR UPPER(TRIM(f.exempt)) = 'YES', NULL, 1.00) AS productivity_target_master, 
+    IF(UPPER(TRIM(f.kpi_applicable)) = 'NO' OR UPPER(TRIM(f.exempt)) = 'YES', NULL, 0.20) AS productivity_weight_master,
+
+    -- Applicable Components Count 
+    CASE WHEN UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' THEN 0 ELSE f.v_z END as productivity_applicable_components_count,
+
+    -- Individual component completion percentages
+    FORMAT("%.2f%%", f.v_qa_c * 100) as qa_evals_completion,
+    FORMAT("%.2f%%", f.v_voc_c * 100) as voc_evals_completion,
+    FORMAT("%.2f%%", f.v_cal_c * 100) as calibrations_completion,
+
+    -- Final Score and Performance Categorization
+    IF(f.v_score IS NULL, NULL, FORMAT("%.2f%%", f.v_score * 100)) as productivity_pct_to_goal,
+
+    CASE 
+      WHEN f.v_score IS NULL THEN NULL
+      WHEN f.v_score < 0.90 THEN 1
+      WHEN f.v_score < 1.00 THEN 2
+      ELSE 3
+    END AS productivity_points_obtained,
+
+    CASE 
+      WHEN UPPER(TRIM(f.kpi_applicable)) = 'NO' THEN 'N/A'
+      WHEN UPPER(TRIM(f.exempt)) = 'YES' THEN 'Exempt'
+      WHEN f.v_score IS NULL THEN NULL
+      WHEN f.v_score < 0.90 THEN 'Improvement Required'
+      WHEN f.v_score < 1.00 THEN 'Developing'
+      ELSE 'Achieving'
+    END AS productivity_status,
+
+    -- Earned Weight Calculation (Formatted for reporting views)
+    IF(UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' OR f.v_score IS NULL, NULL, 
+       FORMAT("%.2f%%", (0.20 * (CASE WHEN f.v_score < 0.90 THEN (1/3) WHEN f.v_score < 1.00 THEN (2/3) ELSE 1.00 END)) * 100)) as productivity_earned_weight,
+
+    -- Final Score Metric Points (Raw numerical value)
+    IF(UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' OR f.v_score IS NULL, NULL, 
+       SAFE_CAST((CASE WHEN f.v_score < 0.90 THEN 1 WHEN f.v_score < 1.00 THEN 2 ELSE 3 END) * 0.20 AS FLOAT64)) as productivity_points_obtained_for_final_score_only,
+
+    -- Diluted weight adjustment for multi-program allocation
+    IF(UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' OR f.v_score IS NULL, NULL, 
+       (0.20 * (CASE WHEN f.v_score < 0.90 THEN (1/3) WHEN f.v_score < 1.00 THEN (2/3) ELSE 1.00 END)) * SAFE_DIVIDE(1.0, NULLIF(COUNT(program) OVER(PARTITION BY tm_wdid, report_month, report_year), 0))) as productivity_weight_obtaiend_program_diluted,
+
+    CONCAT(report_year, '|', LEFT(report_month, 3), '|TL', tl_wdid, '|QA', tm_wdid, '|', program) as key
+
+  FROM final_math f;
+
+END;
