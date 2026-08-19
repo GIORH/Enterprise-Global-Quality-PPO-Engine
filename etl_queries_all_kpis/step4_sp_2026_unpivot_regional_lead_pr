@@ -1,0 +1,439 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step4_sp_2026_unpivot_regional_lead_pr`()
+BEGIN
+
+    /************************************************************************************************
+     PROCEDURE: step4_sp_2026_unpivot_regional_lead_pr
+     TABLE: 2026_scorecard_qa_regional_lead_unpivoted_pr
+     DESCRIPTION: Big Rolled-Up Payroll (PR) Unpivot structure for Regional Leads[cite: 24].
+                  Collapses operational granularity to Person/Month/Year/KPI level for 6 base metrics[cite: 24].
+                  Calculates percent_to_target using AVG for all metrics (no capping logic applied)[cite: 24].
+                  Dynamically calculates the 'Final Score' row based on the sum of ratings[cite: 24].
+                  Adds two progressive YTD cumulative columns tracking month-over-month evolution: 
+                  ytd_final_scores and ytd_final_tier[cite: 24].
+                  Includes dynamic 'is_latest_month' flag for seamless Looker Studio filtering[cite: 24].
+    ************************************************************************************************/
+
+    CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_regional_lead_unpivoted_pr` AS
+
+    WITH 
+        /* =========================================================================================
+           CTE 1: DYNAMIC FULL ACCESS EMAIL CONSOLIDATION
+           Aggregates privileged system access emails across Telus Digital and Telus International sources 
+           to construct a universal RLS bypass list[cite: 24].
+        ========================================================================================= */
+        full_access_list AS (
+          SELECT STRING_AGG(email, ',') AS full_access_emails
+          FROM (
+            SELECT LOWER(TRIM(telus_digital_email)) AS email 
+            FROM `ti-ca-ml-start.QA_Training_scorecards.2026_full_access_security_emails_raw` 
+            WHERE telus_digital_email IS NOT NULL AND TRIM(telus_digital_email) != ''
+            
+            UNION DISTINCT
+            
+            SELECT LOWER(TRIM(telus_international_email)) AS email 
+            FROM `ti-ca-ml-start.QA_Training_scorecards.2026_full_access_security_emails_raw` 
+            WHERE telus_international_email IS NOT NULL AND TRIM(telus_international_email) != ''
+          )
+        ),
+
+        /* =========================================================================================
+           CTE 2: HISTORICAL ROSTER SECURITY MAPPING
+           Extracts global roster supervisory chains per employee, month, and year[cite: 24]. Cleanses Workday IDs 
+           and month keys, aggregating up to 6 supervisory levels into comma-separated lists[cite: 24].
+        ========================================================================================= */
+        roster_security AS (
+          SELECT 
+            REGEXP_REPLACE(TRIM(CAST(employee_id AS STRING)), r'\.0$', '') AS employee_id_std,
+            UPPER(TRIM(SUBSTR(CAST(month AS STRING), 1, 3))) AS month_std,
+            SAFE_CAST(year AS STRING) AS year_std,
+            LOWER(TRIM(email_primary_work)) AS evaluated_email,
+            LOWER(TRIM(inmediate_supervisor_1_email)) AS supervisor_1_email,
+            ARRAY_TO_STRING(
+              ARRAY(
+                SELECT DISTINCT email
+                FROM UNNEST([
+                  LOWER(TRIM(email_primary_work)),
+                  LOWER(TRIM(inmediate_supervisor_1_email)),
+                  LOWER(TRIM(inmediate_supervisor_2_email)),
+                  LOWER(TRIM(inmediate_supervisor_3_email)),
+                  LOWER(TRIM(inmediate_supervisor_4_email)),
+                  LOWER(TRIM(inmediate_supervisor_5_email)),
+                  LOWER(TRIM(inmediate_supervisor_6_email))
+                ]) AS email
+                WHERE email IS NOT NULL AND TRIM(email) != ''
+              ), ','
+            ) AS full_chain_emails
+          FROM `ti-ca-ml-start.QA_Training_scorecards.2026_historical_qa_global_roster_proposal_raw`
+          WHERE employee_id IS NOT NULL 
+            AND TRIM(CAST(employee_id AS STRING)) NOT IN ('', '-', 'NULL')
+          QUALIFY ROW_NUMBER() OVER(
+            PARTITION BY 
+              REGEXP_REPLACE(TRIM(CAST(employee_id AS STRING)), r'\.0$', ''),
+              UPPER(TRIM(SUBSTR(CAST(month AS STRING), 1, 3))),
+              SAFE_CAST(year AS STRING)
+            ORDER BY employee_id
+          ) = 1
+        ),
+
+        /* =========================================================================================
+           CTE 3: CONSOLIDATED SOURCE SELECTION
+           Loads consolidated Regional QA Lead metrics, filtering out null Workday IDs[cite: 24].
+        ========================================================================================= */
+        Source_Data AS (
+            SELECT * FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_regional_lead_consolidated`
+            WHERE lead_wdid IS NOT NULL
+        ),
+
+        /* =========================================================================================
+           CTE 4: EXCLUSIVE UNPIVOT OF THE 6 BASE METRICS
+           Unpivots individual operational, management, and leadership metric blocks for Regional Leads[cite: 24]. 
+           Parses percentage strings to numeric target master values and ratio formats[cite: 24].
+        ========================================================================================= */
+        Unpivoted_Metrics AS (
+            /* --- 1. SEI BLOCK --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))) AS performance_date,
+                report_year, report_month, role AS position_role, 
+                SAFE_CAST(lead_wdid AS STRING) AS employee_id, lead_name AS quality_team_member,
+                CAST(NULL AS STRING) AS immediate_supervisor, CAST(NULL AS STRING) AS immediate_manager, CAST(NULL AS STRING) AS immediate_sr_manager,
+                sei_kpi AS kpi, sei_business_category AS business_category, 
+                SAFE_CAST(sei_weight AS FLOAT64) AS weight_master,
+                CASE WHEN STRPOS(CAST(sei_target AS STRING), '%') > 0 THEN SAFE_CAST(REPLACE(CAST(sei_target AS STRING), '%', '') AS FLOAT64) / 100 ELSE SAFE_CAST(sei_target AS FLOAT64) END AS target_master,
+                SAFE_CAST(REPLACE(CAST(sei_ptg AS STRING), '%', '') AS FLOAT64) / 100 AS target_obtained
+            FROM Source_Data
+
+            UNION ALL
+
+            /* --- 2. PPD BLOCK --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year, report_month, role, SAFE_CAST(lead_wdid AS STRING), lead_name,
+                NULL, NULL, NULL,
+                ppd_kpi, ppd_business_category, 
+                SAFE_CAST(ppd_weight AS FLOAT64),
+                CASE WHEN STRPOS(CAST(ppd_target AS STRING), '%') > 0 THEN SAFE_CAST(REPLACE(CAST(ppd_target AS STRING), '%', '') AS FLOAT64) / 100 ELSE SAFE_CAST(ppd_target AS FLOAT64) END,
+                SAFE_CAST(REPLACE(CAST(ppd_ptg AS STRING), '%', '') AS FLOAT64) / 100
+            FROM Source_Data
+
+            UNION ALL
+
+            /* --- 3. QUALITY BLOCK (CORRECTED TARGET FIELD NAME) --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year, report_month, role, SAFE_CAST(lead_wdid AS STRING), lead_name,
+                NULL, NULL, NULL,
+                qa_kpi, qaptg_business_category,
+                SAFE_CAST(qa_weight AS FLOAT64),
+                CASE WHEN STRPOS(CAST(quality_score_target_program AS STRING), '%') > 0 THEN SAFE_CAST(REPLACE(CAST(quality_score_target_program AS STRING), '%', '') AS FLOAT64) / 100 ELSE SAFE_CAST(quality_score_target_program AS FLOAT64) END,
+                SAFE_CAST(qa_ptg AS FLOAT64)
+            FROM Source_Data
+
+            UNION ALL
+
+            /* --- 4. YETG PERFORMANCE --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year, report_month, role, SAFE_CAST(lead_wdid AS STRING), lead_name,
+                NULL, NULL, NULL,
+                yearly_evals_kpi, yearly_evals_business_category,
+                SAFE_CAST(yearly_evals_weight_master AS FLOAT64),
+                SAFE_CAST(yearly_evals_target_master AS FLOAT64),
+                SAFE_CAST(yearly_evals_ptg AS FLOAT64)
+            FROM Source_Data
+
+            UNION ALL
+
+            /* --- 5. POTP BLOCK --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year, report_month, role, SAFE_CAST(lead_wdid AS STRING), lead_name,
+                NULL, NULL, NULL,
+                potp_kpi, potp_business_category,
+                SAFE_CAST(potp_weight AS FLOAT64),
+                SAFE_CAST(potp_target AS FLOAT64),
+                SAFE_CAST(potp_ptg AS FLOAT64)
+            FROM Source_Data
+
+            UNION ALL
+
+            /* --- 6. COACHING / TEAM DEVELOPMENT --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year, report_month, role, SAFE_CAST(lead_wdid AS STRING), lead_name,
+                NULL, NULL, NULL,
+                coaching_kpi, coaching_business_category,
+                SAFE_CAST(coaching_weight_master AS FLOAT64),
+                SAFE_CAST(coaching_target_master AS FLOAT64),
+                SAFE_CAST(coaching_ptg AS FLOAT64)
+            FROM Source_Data
+        ),
+
+        /* =========================================================================================
+           CTE 5: BIG ROLLED-UP: AGGREGATION LEVEL (AVG FOR ALL)
+           Aggregates metrics by Person/Month/Year/KPI using AVG for all targets and weights[cite: 24].
+        ========================================================================================= */
+        aggregated_pr AS (
+          SELECT 
+            MAX(performance_date) AS performance_date,
+            report_year, report_month, position_role, employee_id,
+            ANY_VALUE(quality_team_member) AS quality_team_member,
+            ANY_VALUE(immediate_supervisor) AS immediate_supervisor,
+            ANY_VALUE(immediate_manager) AS immediate_manager,
+            ANY_VALUE(immediate_sr_manager) AS immediate_sr_manager,
+            kpi, ANY_VALUE(business_category) AS business_category,
+            AVG(weight_master) AS weight_master,
+            AVG(target_master) AS target_master,
+            AVG(target_obtained) AS percent_to_target
+          FROM Unpivoted_Metrics
+          GROUP BY report_year, report_month, position_role, employee_id, kpi
+        ),
+
+        /* =========================================================================================
+           CTE 6: BASE CALCULATION COMPLETED FOR THE 6 METRICS (REGIONAL LEAD TIERS)
+           Assigns achievement tiers ('IR', 'D', 'A', 'E'), maximum available point ceilings (4.0), 
+           and metric points based on standard Regional Lead threshold rules[cite: 24].
+        ========================================================================================= */
+        base_metrics AS (
+          SELECT 
+            a.*,
+            
+            -- ACHIEVEMENT TIER (Lead Rules)
+            CASE 
+              WHEN a.kpi = 'Service Excellence Index' THEN CASE WHEN a.percent_to_target IS NULL THEN NULL WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+              WHEN a.kpi = 'PPD' THEN CASE WHEN a.percent_to_target IS NULL THEN NULL WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+              WHEN a.kpi = 'Quality % to Goal' THEN CASE WHEN a.percent_to_target IS NULL THEN NULL WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+              WHEN a.kpi = 'Yearly Evaluations (% to goal)' THEN CASE WHEN a.percent_to_target IS NULL THEN NULL WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+              WHEN a.kpi = '% of Top Performers' THEN CASE WHEN a.percent_to_target IS NULL THEN NULL WHEN a.percent_to_target < 0.75 THEN 'IR' WHEN a.percent_to_target < 0.90 THEN 'D' WHEN a.percent_to_target < 0.95 THEN 'A' ELSE 'E' END
+              WHEN a.kpi = 'Coaching' THEN CASE WHEN a.percent_to_target IS NULL THEN NULL WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+            END AS achievement_tier,
+
+            -- MAX POINTS AVAILABLE (Leads have 4.0 for all base metrics)
+            CASE 
+              WHEN a.percent_to_target IS NULL THEN NULL
+              ELSE 4.0
+            END AS max_points_available,
+
+            -- METRIC POINTS
+            CASE 
+              WHEN a.percent_to_target IS NULL THEN NULL
+              ELSE
+                CASE 
+                  WHEN (CASE WHEN a.kpi = 'Service Excellence Index' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'PPD' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Quality % to Goal' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Yearly Evaluations (% to goal)' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = '% of Top Performers' THEN CASE WHEN a.percent_to_target < 0.75 THEN 'IR' WHEN a.percent_to_target < 0.90 THEN 'D' WHEN a.percent_to_target < 0.95 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Coaching' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                       END) = 'IR' THEN 1.0
+                  WHEN (CASE WHEN a.kpi = 'Service Excellence Index' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'PPD' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Quality % to Goal' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Yearly Evaluations (% to goal)' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = '% of Top Performers' THEN CASE WHEN a.percent_to_target < 0.75 THEN 'IR' WHEN a.percent_to_target < 0.90 THEN 'D' WHEN a.percent_to_target < 0.95 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Coaching' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                       END) = 'D' THEN 2.0
+                  WHEN (CASE WHEN a.kpi = 'Service Excellence Index' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'PPD' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Quality % to Goal' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Yearly Evaluations (% to goal)' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = '% of Top Performers' THEN CASE WHEN a.percent_to_target < 0.75 THEN 'IR' WHEN a.percent_to_target < 0.90 THEN 'D' WHEN a.percent_to_target < 0.95 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Coaching' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                       END) = 'A' THEN 3.0
+                  WHEN (CASE WHEN a.kpi = 'Service Excellence Index' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'PPD' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Quality % to Goal' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Yearly Evaluations (% to goal)' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = '% of Top Performers' THEN CASE WHEN a.percent_to_target < 0.75 THEN 'IR' WHEN a.percent_to_target < 0.90 THEN 'D' WHEN a.percent_to_target < 0.95 THEN 'A' ELSE 'E' END
+                             WHEN a.kpi = 'Coaching' THEN CASE WHEN a.percent_to_target < 0.90 THEN 'IR' WHEN a.percent_to_target < 1.00 THEN 'D' WHEN a.percent_to_target < 1.01 THEN 'A' ELSE 'E' END
+                       END) = 'E' THEN 4.0
+                END
+            END AS metric_points
+          FROM aggregated_pr a
+        ),
+
+        /* =========================================================================================
+           CTE 7: MULTIPLIED CALCULATIONS FOR THE 6 METRICS
+           Computes earned metric weights (`metric_weight_obtained`), maximum rating ceilings 
+           (`max_rating_available`), and ratings obtained (`rating_obtained`)[cite: 24].
+        ========================================================================================= */
+        calculated_base_metrics AS (
+          SELECT 
+            *,
+            IF(metric_points IS NOT NULL AND weight_master IS NOT NULL, weight_master * (metric_points / 4.0), NULL) AS metric_weight_obtained,
+            IF(percent_to_target IS NOT NULL AND max_points_available IS NOT NULL AND weight_master IS NOT NULL, weight_master * max_points_available, NULL) AS max_rating_available,
+            IF(metric_points IS NOT NULL AND weight_master IS NOT NULL, weight_master * metric_points, NULL) AS rating_obtained
+          FROM base_metrics
+        ),
+
+        /* =========================================================================================
+           CTE 8: 'FINAL SCORE' ROW GENERATION
+           Aggregates monthly ratings across active base metrics to dynamically construct the overall 
+           'Final Score' row and assign overall achievement tiers ('IR', 'D', 'A', 'E')[cite: 24].
+        ========================================================================================= */
+        final_score_cte AS (
+          SELECT 
+            MAX(performance_date) AS performance_date,
+            report_year, 
+            report_month, 
+            ANY_VALUE(position_role) AS position_role,
+            employee_id, 
+            ANY_VALUE(quality_team_member) AS quality_team_member,
+            ANY_VALUE(immediate_supervisor) AS immediate_supervisor, 
+            ANY_VALUE(immediate_manager) AS immediate_manager, 
+            ANY_VALUE(immediate_sr_manager) AS immediate_sr_manager,
+            'Final Score' AS kpi,
+            'All' AS business_category,
+            
+            -- Sum of active Weight Master for the month
+            SUM(weight_master) AS weight_master,
+            
+            CAST(NULL AS FLOAT64) AS target_master,
+            
+            -- Percent to target (Rating Obtained / Max Rating Available)
+            SUM(rating_obtained) / NULLIF(SUM(max_rating_available), 0) AS percent_to_target,
+            
+            -- Achievement Tier for Final Score (Lead Logic: <0.87 for A)
+            CASE 
+              WHEN SUM(max_rating_available) IS NULL OR SUM(max_rating_available) = 0 THEN NULL
+              WHEN ROUND(SUM(rating_obtained) / NULLIF(SUM(max_rating_available), 0), 4) < 0.50 THEN 'IR'
+              WHEN ROUND(SUM(rating_obtained) / NULLIF(SUM(max_rating_available), 0), 4) < 0.75 THEN 'D'
+              WHEN ROUND(SUM(rating_obtained) / NULLIF(SUM(max_rating_available), 0), 4) < 0.87 THEN 'A'
+              ELSE 'E'
+            END AS achievement_tier,
+
+            SUM(max_points_available) AS max_points_available,
+            SUM(metric_points) AS metric_points,
+            SUM(weight_master) AS metric_weight_obtained,
+            SUM(max_rating_available) AS max_rating_available,
+            SUM(rating_obtained) AS rating_obtained
+          FROM calculated_base_metrics
+          -- Only sum if there were targets
+          WHERE percent_to_target IS NOT NULL 
+          GROUP BY report_year, report_month, employee_id
+        ),
+
+        /* =========================================================================================
+           CTE 9: METRIC CONSOLIDATION
+           Unions the six base Regional Lead metrics with the aggregated 'Final Score' row[cite: 24].
+        ========================================================================================= */
+        all_metrics AS (
+          SELECT * FROM calculated_base_metrics
+          UNION ALL
+          SELECT * FROM final_score_cte
+        ),
+
+        /* =========================================================================================
+           CTE 10: PROGRESSIVE YTD FINAL SCORES CALCULATION
+           Computes month-over-month running cumulative average ratios (`ytd_final_scores`) 
+           partitioned by Employee ID, Year, and KPI[cite: 24].
+        ========================================================================================= */
+        metrics_with_ytd AS (
+          SELECT 
+            m.*,
+            AVG(m.percent_to_target) OVER(
+              PARTITION BY m.employee_id, m.report_year, m.kpi
+              ORDER BY m.performance_date
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS ytd_final_scores
+          FROM all_metrics m
+        ),
+
+        /* =========================================================================================
+           CTE 11: YTD FINAL TIER CALCULATION
+           Maps cumulative `ytd_final_scores` ratios to progressive YTD achievement tiers (`ytd_final_tier`)[cite: 24].
+        ========================================================================================= */
+        final_metrics AS (
+          SELECT 
+            y.*,
+            CASE 
+              WHEN y.ytd_final_scores IS NULL THEN NULL
+              WHEN y.kpi = 'Service Excellence Index' THEN CASE WHEN y.ytd_final_scores < 0.90 THEN 'IR' WHEN y.ytd_final_scores < 1.00 THEN 'D' WHEN y.ytd_final_scores < 1.01 THEN 'A' ELSE 'E' END
+              WHEN y.kpi = 'PPD' THEN CASE WHEN y.ytd_final_scores < 0.90 THEN 'IR' WHEN y.ytd_final_scores < 1.00 THEN 'D' WHEN y.ytd_final_scores < 1.01 THEN 'A' ELSE 'E' END
+              WHEN y.kpi = 'Quality % to Goal' THEN CASE WHEN y.ytd_final_scores < 0.90 THEN 'IR' WHEN y.ytd_final_scores < 1.00 THEN 'D' WHEN y.ytd_final_scores < 1.01 THEN 'A' ELSE 'E' END
+              WHEN y.kpi = 'Yearly Evaluations (% to goal)' THEN CASE WHEN y.ytd_final_scores < 0.90 THEN 'IR' WHEN y.ytd_final_scores < 1.00 THEN 'D' WHEN y.ytd_final_scores < 1.01 THEN 'A' ELSE 'E' END
+              WHEN y.kpi = '% of Top Performers' THEN CASE WHEN y.ytd_final_scores < 0.75 THEN 'IR' WHEN y.ytd_final_scores < 0.90 THEN 'D' WHEN y.ytd_final_scores < 0.95 THEN 'A' ELSE 'E' END
+              WHEN y.kpi = 'Coaching' THEN CASE WHEN y.ytd_final_scores < 0.90 THEN 'IR' WHEN y.ytd_final_scores < 1.00 THEN 'D' WHEN y.ytd_final_scores < 1.01 THEN 'A' ELSE 'E' END
+              WHEN y.kpi = 'Final Score' THEN 
+                CASE 
+                  WHEN ROUND(y.ytd_final_scores, 4) < 0.50 THEN 'IR'
+                  WHEN ROUND(y.ytd_final_scores, 4) < 0.75 THEN 'D'
+                  WHEN ROUND(y.ytd_final_scores, 4) < 0.87 THEN 'A'
+                  ELSE 'E'
+                END
+            END AS ytd_final_tier
+          FROM metrics_with_ytd y
+        )
+
+    /* =========================================================================================
+       FINAL SELECTION & 3-LEVEL SECURITY COUPLING
+       Projects unpivoted dimensions, appends the dynamic `is_latest_month` boolean flag[cite: 24], 
+       and couples the 3-Level Row Level Security (RLS) governance model[cite: 24].
+    ========================================================================================= */
+    SELECT 
+        f.performance_date, 
+        f.report_year, 
+        f.report_month, 
+        f.position_role, 
+        f.employee_id, 
+        f.quality_team_member, 
+        f.immediate_supervisor, 
+        f.immediate_manager, 
+        f.immediate_sr_manager,
+        f.kpi, 
+        f.business_category, 
+        f.weight_master,
+        f.target_master,
+        f.percent_to_target,
+        f.achievement_tier,
+        f.max_points_available,
+        f.metric_points,
+        f.metric_weight_obtained,
+        f.max_rating_available,
+        f.rating_obtained,
+        f.ytd_final_scores,
+        f.ytd_final_tier,
+        
+        -- DYNAMIC LATEST MONTH FLAG FOR PERMANENT LOOKER STUDIO FILTER
+        IF(f.performance_date = MAX(f.performance_date) OVER(PARTITION BY f.report_year), TRUE, FALSE) AS is_latest_month,
+        
+        -- FIRST LEVEL SECURITY: Evaluated Employee Email + Full Access System Emails
+        NULLIF(
+          ARRAY_TO_STRING(
+            ARRAY(
+              SELECT DISTINCT email
+              FROM UNNEST(SPLIT(CONCAT(IFNULL(r.evaluated_email, ''),',',IFNULL(fa.full_access_emails, '')), ',')) AS email
+              WHERE email IS NOT NULL AND TRIM(email) != ''
+            ), ','
+          ), ''
+        ) AS first_level_security,
+
+        -- SECOND LEVEL SECURITY: Immediate Supervisor 1 Email + Full Access System Emails
+        NULLIF(
+          ARRAY_TO_STRING(
+            ARRAY(
+              SELECT DISTINCT email
+              FROM UNNEST(SPLIT(CONCAT(IFNULL(r.supervisor_1_email, ''),',',IFNULL(fa.full_access_emails, '')), ',')) AS email
+              WHERE email IS NOT NULL AND TRIM(email) != ''
+            ), ','
+          ), ''
+        ) AS second_level_security,
+
+        -- THIRD LEVEL SECURITY: Evaluated Email + Full Hierarchy Chain (L1-L6) + Full Access System Emails
+        NULLIF(
+          ARRAY_TO_STRING(
+            ARRAY(
+              SELECT DISTINCT email
+              FROM UNNEST(SPLIT(CONCAT(IFNULL(r.full_chain_emails, ''),',',IFNULL(fa.full_access_emails, '')), ',')) AS email
+              WHERE email IS NOT NULL AND TRIM(email) != ''
+            ), ','
+          ), ''
+        ) AS third_level_security
+
+    FROM final_metrics f
+    CROSS JOIN full_access_list fa
+    LEFT JOIN roster_security r
+      ON REGEXP_REPLACE(TRIM(CAST(f.employee_id AS STRING)), r'\.0$', '') = r.employee_id_std
+     AND UPPER(TRIM(SUBSTR(CAST(f.report_month AS STRING), 1, 3))) = r.month_std
+     AND SAFE_CAST(f.report_year AS STRING) = r.year_std;
+
+END;
