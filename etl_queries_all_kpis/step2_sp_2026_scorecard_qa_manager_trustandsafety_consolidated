@@ -1,0 +1,352 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_qa_manager_trustandsafety_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step2_sp_2026_scorecard_qa_manager_trustandsafety_consolidated
+   DESCRIPTION: Master consolidation procedure for the Trust & Safety CX Quality Manager Scorecard. 
+                Unifies rolled-up operational metrics (Accepted Appeals, Quality % to Goal) with 
+                non-rolled-up development metrics (Innovation, PPD). Dynamically integrates 
+                leadership pillars: Yearly Evaluations (YETG - June only, 10% Weight), Top Performers 
+                (POTP - 10% Weight), and Coaching/Team Development (15% Weight). Standardizes 
+                composite primary keys (WDID_Month_Year_Program_Country) and computes overall 
+                scorecard performance ratios against dynamic maximum available point ceilings.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_qa_manager_trustandsafety_consolidated` AS
+ 
+  /* =========================================================================================
+     CTE 1: SOURCE NORMALIZATION & KEY STANDARDIZATION
+     Parses Manager Workday IDs from raw text fields, removing trailing '.0' floating-point artifacts. 
+     Standardizes reporting months into 3-letter upper-case strings (e.g., 'JUN').
+  ========================================================================================= */
+  WITH rolled_up AS (
+    SELECT *,
+      REGEXP_REPLACE(TRIM(CAST(REGEXP_EXTRACT(tl_manager, r'\((\d+)\)') AS STRING)), r'\.0$', '') AS manager_wdid_str,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month_str,
+      REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', '') AS year_str
+    FROM `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_manager_trustandsafety_rolled_up_consolidated`
+    WHERE REGEXP_EXTRACT(tl_manager, r'\((\d+)\)') IS NOT NULL
+      AND TRIM(REGEXP_EXTRACT(tl_manager, r'\((\d+)\)')) NOT IN ('', '-', 'NULL')
+  ),
+ 
+  non_rolled_up AS (
+    SELECT *,
+      REGEXP_REPLACE(TRIM(CAST(manager_wdid AS STRING)), r'\.0$', '') AS manager_wdid_str,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month_str,
+      REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', '') AS year_str
+    FROM `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_manager_trustandsafety_non_rolled_up_consolidated`
+    WHERE manager_wdid IS NOT NULL
+      AND TRIM(CAST(manager_wdid AS STRING)) NOT IN ('', '-', 'NULL')
+  ),
+
+  /* =========================================================================================
+     CTE 2: BASE CONSOLIDATION & PRIMARY KEY CONSTRUCTION
+     FULL OUTER JOINs rolled-up operational data with non-rolled-up development data. Constructs 
+     the standard primary composite key (WDID_Month_Year_Program_Country) and preserves Year-to-Date 
+     (YTD) cumulative metrics for Innovation and PPD.
+  ========================================================================================= */
+  Base_Scorecard AS (
+    SELECT
+      'T&S Quality Manager/Sr Manager' AS role,
+      
+      -- Standard Composite Primary Key
+      CONCAT(
+        COALESCE(r.manager_wdid_str, nr.manager_wdid_str), '_', 
+        COALESCE(r.month_str, nr.month_str), '_', 
+        COALESCE(r.year_str, nr.year_str),
+        IFNULL(CONCAT('_', r.program), ''),
+        IFNULL(CONCAT('_', COALESCE(r.country, nr.country)), '')
+      ) AS primary_key,
+      
+      SAFE_CAST(COALESCE(r.manager_wdid_str, nr.manager_wdid_str) AS INT64) AS manager_wdid,
+      COALESCE(r.date, SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(nr.report_month), ' ', CAST(nr.report_year AS STRING)))) AS date,
+      COALESCE(r.month_str, nr.month_str) AS report_month,
+      SAFE_CAST(COALESCE(r.year_str, nr.year_str) AS INT64) AS report_year,
+      COALESCE(r.tl_manager, nr.tl_manager) AS tl_manager,
+      COALESCE(nr.tl_sr_manager, r.tl_sr_manager) AS tl_sr_manager,
+      r.program,
+      COALESCE(r.country, nr.country) AS country,
+      COALESCE(r.region, nr.region) AS region,
+      
+      -- Accepted Appeals Block
+      r.accepted_appeals_business_category, r.accepted_appeals_kpi, r.aa_actual, r.aa_score_target_program, r.accepted_appeals_weight_master, r.accepted_appeals_target, r.accepted_appeals_ptg, r.accepted_appeals_achievement_tier, r.accepted_appeals_points_obtained, r.accepted_appeals_weight_obtained, r.accepted_appeals_points_final_score,
+      
+      -- Quality Block
+      r.qaptg_business_category, r.qa_kpi, r.quality_score_actual, r.quality_score_target_program, r.quality_weight_master, r.quality_ptg, r.quality_achievement_tier, r.quality_points_obtained, r.quality_weight_obtained, r.quality_points_final_score,
+      
+      -- Innovation Block (Includes _ytd tracking)
+      nr.innovation_businesscategory, nr.innovation_kpi, nr.innovation_kpi_applicable, nr.innovation_exempt, nr.innovation_reason, nr.innovation_high_count, nr.innovation_med_count, nr.innovation_low_count, nr.innovation_metric_points, nr.innovation_metric_points_ytd, nr.innovation_target, nr.innovation_weight, nr.innovation_ptg, nr.innovation_weight_obtained, nr.innovation_achievement, nr.innovation_points_obtained, nr.innovation_points_obtained_for_final_score_only,
+      
+      -- PPD Block (Includes _ytd tracking)
+      nr.ppd_businesscategory, nr.ppd_kpi, nr.ppd_kpi_applicable, nr.ppd_exempt, nr.ppd_reason, nr.ppd_mandatory_completed, nr.ppd_mandatory_completed_ytd, nr.ppd_required_courses, nr.ppd_required_courses_ytd, nr.ppd_target, nr.ppd_ptg, nr.ppd_weight, nr.ppd_achievement_category, nr.ppd_weight_obtained, nr.ppd_points_obtained, nr.ppd_points_obtained_for_final_score_only
+      
+    FROM rolled_up r
+    FULL OUTER JOIN non_rolled_up nr
+      ON r.manager_wdid_str = nr.manager_wdid_str
+     AND r.month_str = nr.month_str
+     AND r.year_str = nr.year_str
+  ),
+
+  /* =========================================================================================
+     CTE 3: EXCLUSIVE YETG SOURCE INTEGRATION
+     Extracts yearly evaluation scores from the global roster for Managers, standardizing 
+     Employee Workday IDs and 3-letter month keys.
+  ========================================================================================= */
+  leadership_manager_agg AS (
+    SELECT 
+      REGEXP_REPLACE(TRIM(CAST(Employee_ID AS STRING)), r'\.0$', '') AS wdid,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month,
+      REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', '') AS year,
+      SAFE_CAST(leadership_ptg AS FLOAT64) AS leadership_ptg
+    FROM `ti-ca-ml-start.QA_Training_scorecards.global_qa_roster_with_scores`
+    WHERE Employee_ID IS NOT NULL
+  ),
+
+  /* =========================================================================================
+     CTE 4: COACHING PRE-AGGREGATION FOR MANAGERS
+     Aggregates performed and target coaching volumes grouped by Coach Workday ID and reporting 
+     period. Consolidates exemption flags and exception reasons.
+  ========================================================================================= */
+  coaching_manager_agg AS (
+    SELECT 
+      REGEXP_REPLACE(TRIM(CAST(coach_wdid AS STRING)), r'\.0$', '') AS wdid,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month,
+      SAFE_CAST(report_year AS STRING) AS year,
+      SUM(coachings_performed) AS coachings_performed,
+      SUM(coachings_target) AS coachings_target,
+      MAX(CASE WHEN UPPER(TRIM(CAST(exempt AS STRING))) = 'YES' THEN 'Yes' ELSE 'No' END) AS exempt,
+      STRING_AGG(DISTINCT NULLIF(TRIM(exempt_reason), ''), ' | ') AS exempt_reason
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_coaching_leadership_general`
+    WHERE coach_wdid IS NOT NULL 
+      AND TRIM(CAST(coach_wdid AS STRING)) NOT IN ('', '-', 'NULL')
+    GROUP BY 1, 2, 3
+  ),
+
+  /* =========================================================================================
+     CTE 5: MULTI-PILLAR INTEGRATION (YETG, POTP, COACHING)
+     Joins Leadership, POTP, and Coaching datasets to the Base Scorecard using composite keys. 
+     Evaluates dynamic pillar applicability (e.g., Leadership active strictly in June ('JUN')).
+  ========================================================================================= */
+  Scorecard_With_POTP AS (
+    SELECT
+      b.*,
+      
+      -- ===========================================================================
+      -- PILLAR INTEGRATION: YETG (10% WEIGHT - JUNE ONLY)
+      -- ===========================================================================
+      CAST('My Team' AS STRING) AS yearly_evals_business_category,
+      CAST('Yearly Evaluations (% to goal)' AS STRING) AS yearly_evals_kpi,
+      1.00 AS yearly_evals_target_master,
+      
+      CASE 
+        WHEN b.report_month = 'JUN' AND l.leadership_ptg IS NOT NULL THEN 0.10 
+        ELSE NULL 
+      END AS yearly_evals_weight_master,
+      
+      CASE WHEN b.report_month = 'JUN' THEN l.leadership_ptg ELSE NULL END AS yearly_evals_ptg,
+      CAST(CASE WHEN b.report_month = 'JUN' AND l.leadership_ptg IS NOT NULL THEN 'Yes' ELSE 'No' END AS STRING) AS yearly_evals_kpi_applicable,
+      
+      CASE 
+        WHEN b.report_month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 'Improvement Required'
+        WHEN l.leadership_ptg < 1.00 THEN 'Developing'
+        WHEN l.leadership_ptg < 1.01 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS yearly_evals_achievement_category,
+
+      CASE 
+        WHEN b.report_month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 1
+        WHEN l.leadership_ptg < 1.00 THEN 2
+        WHEN l.leadership_ptg < 1.01 THEN 3
+        ELSE 4
+      END AS yearly_evals_metric_points,
+
+      CASE 
+        WHEN b.report_month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 0.25
+        WHEN l.leadership_ptg < 1.00 THEN 0.50
+        WHEN l.leadership_ptg < 1.01 THEN 0.75
+        ELSE 1.00
+      END * 0.10 AS yearly_evals_weight_earned,
+
+      CASE 
+        WHEN b.report_month != 'JUN' THEN NULL
+        WHEN l.leadership_ptg IS NULL THEN NULL
+        WHEN l.leadership_ptg < 0.90 THEN 1
+        WHEN l.leadership_ptg < 1.00 THEN 2
+        WHEN l.leadership_ptg < 1.01 THEN 3
+        ELSE 4
+      END * 0.10 AS yearly_evals_points_final_score,
+
+      -- ===========================================================================
+      -- PILLAR INTEGRATION: POTP (10% WEIGHT)
+      -- ===========================================================================
+      CAST('My Team' AS STRING) AS potp_business_category,
+      CAST('% of Top Performers' AS STRING) AS potp_kpi,
+      p.count_top_performers AS potp_count_top_performers,
+      p.count_total AS potp_count_total,
+      CAST(CASE WHEN p.count_total IS NULL OR p.count_total = 0 THEN 'No' ELSE 'Yes' END AS STRING) AS potp_kpi_applicable,
+      CAST('No' AS STRING) AS potp_exempt,
+      CAST(NULL AS STRING) AS potp_reason,
+      
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL 
+        ELSE 0.10 
+      END AS potp_weight,
+      
+      p.target_master AS potp_target,
+      p.potp_ptg AS potp_ptg,
+      
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 'Improvement Required'
+        WHEN p.potp_ptg < 0.90 THEN 'Developing'
+        WHEN p.potp_ptg < 0.95 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS potp_achievement_tier,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 1
+        WHEN p.potp_ptg < 0.90 THEN 2
+        WHEN p.potp_ptg < 0.95 THEN 3
+        ELSE 4
+      END AS potp_points_obtained,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 0.25
+        WHEN p.potp_ptg < 0.90 THEN 0.50
+        WHEN p.potp_ptg < 0.95 THEN 0.75
+        ELSE 1.00
+      END * 0.10 AS potp_weight_obtained,
+
+      CASE 
+        WHEN p.count_total IS NULL OR p.count_total = 0 THEN NULL
+        WHEN p.potp_ptg < 0.75 THEN 1
+        WHEN p.potp_ptg < 0.90 THEN 2
+        WHEN p.potp_ptg < 0.95 THEN 3
+        ELSE 4
+      END * 0.10 AS potp_points_for_final_score,
+
+      -- ===========================================================================
+      -- PILLAR INTEGRATION: COACHING / TEAM DEVELOPMENT (15% WEIGHT)
+      -- ===========================================================================
+      CAST('My Business' AS STRING) AS coaching_business_category,
+      CAST('Coaching / Team development' AS STRING) AS coaching_kpi,
+      c.coachings_performed AS coaching_count_performed,
+      c.coachings_target AS coaching_count_target,
+      CAST(IFNULL(c.exempt, 'No') AS STRING) AS coaching_exempt,
+      c.exempt_reason AS coaching_reason,
+      1.00 AS coaching_target_master,
+      
+      CASE 
+        WHEN c.wdid IS NULL OR IFNULL(c.exempt, 'No') = 'Yes' THEN NULL
+        ELSE 0.15
+      END AS coaching_weight_master,
+      
+      CASE 
+        WHEN c.wdid IS NULL OR IFNULL(c.exempt, 'No') = 'Yes' THEN NULL
+        ELSE SAFE_DIVIDE(c.coachings_performed, c.coachings_target)
+      END AS coaching_ptg,
+
+      CASE 
+        WHEN c.wdid IS NULL OR IFNULL(c.exempt, 'No') = 'Yes' THEN NULL
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 0.90 THEN 'Improvement Required'
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 1.00 THEN 'Developing'
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 1.01 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS coaching_achievement_category,
+
+      CASE 
+        WHEN c.wdid IS NULL OR IFNULL(c.exempt, 'No') = 'Yes' THEN NULL
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 0.90 THEN 1
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 1.00 THEN 2
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 1.01 THEN 3
+        ELSE 4
+      END AS coaching_points_obtained,
+
+      CASE 
+        WHEN c.wdid IS NULL OR IFNULL(c.exempt, 'No') = 'Yes' THEN NULL
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 0.90 THEN 0.25
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 1.00 THEN 0.50
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 1.01 THEN 0.75
+        ELSE 1.00
+      END * 0.15 AS coaching_weight_earned,
+
+      CASE 
+        WHEN c.wdid IS NULL OR IFNULL(c.exempt, 'No') = 'Yes' THEN NULL
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 0.90 THEN 1
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 1.00 THEN 2
+        WHEN SAFE_DIVIDE(c.coachings_performed, c.coachings_target) < 1.01 THEN 3
+        ELSE 4
+      END * 0.15 AS coaching_points_final_score
+
+    FROM Base_Scorecard b
+    LEFT JOIN leadership_manager_agg l
+      ON REGEXP_REPLACE(TRIM(CAST(b.manager_wdid AS STRING)), r'\.0$', '') = l.wdid
+     AND b.report_month = l.month
+     AND REGEXP_REPLACE(TRIM(CAST(b.report_year AS STRING)), r'\.0$', '') = l.year
+    -- Integrated quintuple join using WDID, Month, Year, Program, Country
+    LEFT JOIN `ti-ca-ml-start.QA_Training_scorecards.2026_potp_all_roles_etl_output` p
+      ON REGEXP_REPLACE(TRIM(CAST(b.manager_wdid AS STRING)), r'\.0$', '') = REGEXP_REPLACE(TRIM(CAST(p.inmediate_supervisor_id AS STRING)), r'\.0$', '')
+     AND b.report_month = UPPER(TRIM(SUBSTR(CAST(p.month AS STRING), 1, 3)))
+     AND REGEXP_REPLACE(TRIM(CAST(b.report_year AS STRING)), r'\.0$', '') = REGEXP_REPLACE(TRIM(CAST(p.year AS STRING)), r'\.0$', '')
+     AND (LOWER(TRIM(b.program)) = LOWER(TRIM(p.program)) OR (b.program IS NULL AND TRIM(p.program) IS NULL))
+     AND LOWER(TRIM(b.country)) = LOWER(TRIM(p.country))
+    LEFT JOIN coaching_manager_agg c
+      ON REGEXP_REPLACE(TRIM(CAST(b.manager_wdid AS STRING)), r'\.0$', '') = c.wdid
+     AND b.report_month = c.month
+     AND REGEXP_REPLACE(TRIM(CAST(b.report_year AS STRING)), r'\.0$', '') = c.year
+  ),
+
+  /* =========================================================================================
+     CTE 6: DYNAMIC SCORE & POINT CEILING SUMMATION
+     Dynamically sums earned points across active pillars and calculates the maximum available 
+     point ceiling based on metric applicability.
+  ========================================================================================= */
+  DAPT_Calculations AS (
+    SELECT
+      *,
+      CAST('All' AS STRING) AS final_score_business_category,
+      CAST('Final Score' AS STRING) AS final_score_kpi,
+
+      (COALESCE(accepted_appeals_weight_master, 0) * 4 + 
+        COALESCE(quality_weight_master, 0) * 4 + 
+        COALESCE(innovation_weight, 0) * 4 + 
+        COALESCE(ppd_weight, 0) * 4 +
+        COALESCE(CASE WHEN report_month != 'JUN' OR yearly_evals_ptg IS NULL THEN 0 ELSE 0.10 END * 4, 0) + 
+        COALESCE(CASE WHEN potp_count_total IS NULL OR potp_count_total = 0 THEN 0 ELSE 0.10 END * 4, 0) +
+        COALESCE(CASE WHEN coaching_weight_master IS NULL THEN 0 ELSE 0.15 END * 4, 0)) AS max_final_score_points_available,
+
+      (COALESCE(accepted_appeals_points_final_score, 0) + 
+        COALESCE(quality_points_final_score, 0) + 
+        COALESCE(innovation_points_obtained_for_final_score_only, 0) + 
+        COALESCE(ppd_points_obtained_for_final_score_only, 0) +
+        COALESCE(yearly_evals_points_final_score, 0) + 
+        COALESCE(potp_points_for_final_score, 0) +
+        COALESCE(coaching_points_final_score, 0)) AS final_score_points_obtained
+    FROM Scorecard_With_POTP
+  )
+
+  /* =========================================================================================
+     FINAL MASTER SELECTION
+     Calculates final score ratio (obtained points / max available points) and maps the overall 
+     performance ratio to executive T&S Manager achievement tiers.
+  ========================================================================================= */
+  SELECT
+    *,
+    SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) AS final_score_ptg,
+    CASE 
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.87 THEN 'Excelling'
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.75 THEN 'Achieving'
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.50 THEN 'Developing'
+      ELSE 'Improvement Required'
+    END AS final_score_tier
+  FROM DAPT_Calculations;
+
+END;
