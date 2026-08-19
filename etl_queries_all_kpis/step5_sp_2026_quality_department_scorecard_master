@@ -1,0 +1,315 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step5_sp_2026_quality_department_scorecard_master`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step5_sp_2026_quality_department_scorecard_master
+   DESCRIPTION: Department-wide master consolidation procedure unifying unpivoted scorecard data 
+                across all 8 organizational levels (CX Analysts, Team Leads, Managers, Regional Leads, 
+                Directors, and T&S Analysts, Team Leads, Managers). Preserves standardized 22-column 
+                layout dimensions, FLOAT64 numeric casting, explicit role titling ('CX and T&S Quality 
+                Regional Lead', 'CX and T&S Quality Director'), and propagates 3-Level Row Level Security 
+                (RLS) fields. Dynamically calculates available metric point ceilings, enforcing 
+                null/blank values for Yearly Evaluations outside of the June reporting period.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.quality_department_scorecard_master` AS
+
+  WITH consolidated_data AS (
+
+    /* =========================================================================================
+       1. CX QUALITY ANALYST UNPIVOTED STREAM
+    ========================================================================================= */
+    SELECT 
+      performance_date,
+      position_role,
+      report_month,
+      CAST(report_year AS STRING) AS report_year,
+      REGEXP_REPLACE(CAST(employee_id AS STRING), r'\.0$', '') AS employee_id,
+      quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1,
+      immediate_manager AS inmediate_supervisor_2,
+      immediate_sr_manager AS inmediate_supervisor_3,
+      program,
+      country,
+      region,
+      kpi AS Metric_Name,
+      business_category,
+      SAFE_CAST(target AS FLOAT64) AS actual_target,
+      SAFE_CAST(target_obtained AS FLOAT64) AS percent_to_target,
+      SAFE_CAST(weight AS FLOAT64) AS metric_weight,
+      SAFE_CAST(metric_points AS FLOAT64) AS metric_points,
+      SAFE_CAST(weight_obtained AS FLOAT64) AS weight_earned,
+      tier,
+      SAFE_CAST(points_final_score AS FLOAT64) AS points_final_score,
+      first_level_security,
+      second_level_security,
+      third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_analyst_unpivoted`
+
+    UNION ALL
+
+    /* =========================================================================================
+       2. CX QUALITY TEAM LEAD UNPIVOTED STREAM
+    ========================================================================================= */
+    SELECT 
+      performance_date,
+      position_role,
+      report_month,
+      CAST(report_year AS STRING) AS report_year,
+      REGEXP_REPLACE(CAST(employee_id AS STRING), r'\.0$', '') AS employee_id,
+      quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1,
+      immediate_manager AS inmediate_supervisor_2,
+      immediate_sr_manager AS inmediate_supervisor_3,
+      program,
+      country,
+      region,
+      kpi AS Metric_Name,
+      business_category,
+      SAFE_CAST(target AS FLOAT64) AS actual_target,
+      SAFE_CAST(target_obtained AS FLOAT64) AS percent_to_target,
+      SAFE_CAST(weight AS FLOAT64) AS metric_weight,
+      SAFE_CAST(metric_points AS FLOAT64) AS metric_points,
+      SAFE_CAST(weight_obtained AS FLOAT64) AS weight_earned,
+      tier,
+      SAFE_CAST(points_final_score AS FLOAT64) AS points_final_score,
+      first_level_security,
+      second_level_security,
+      third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_team_lead_unpivoted`
+
+    UNION ALL
+
+    /* =========================================================================================
+       3. CX QUALITY MANAGER UNPIVOTED STREAM
+    ========================================================================================= */
+    SELECT 
+      performance_date,
+      position_role,
+      report_month,
+      CAST(report_year AS STRING) AS report_year,
+      REGEXP_REPLACE(CAST(employee_id AS STRING), r'\.0$', '') AS employee_id,
+      quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1,
+      immediate_manager AS inmediate_supervisor_2,
+      immediate_sr_manager AS inmediate_supervisor_3,
+      program,
+      country,
+      region,
+      kpi AS Metric_Name,
+      business_category,
+      SAFE_CAST(target AS FLOAT64) AS actual_target,
+      SAFE_CAST(target_obtained AS FLOAT64) AS percent_to_target,
+      SAFE_CAST(weight AS FLOAT64) AS metric_weight,
+      SAFE_CAST(metric_points AS FLOAT64) AS metric_points,
+      SAFE_CAST(weight_obtained AS FLOAT64) AS weight_earned,
+      tier,
+      SAFE_CAST(points_final_score AS FLOAT64) AS points_final_score,
+      first_level_security,
+      second_level_security,
+      third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_manager_unpivoted`
+
+    UNION ALL
+
+    /* =========================================================================================
+       4. CX QUALITY REGIONAL LEAD UNPIVOTED STREAM (STANDARDIZED ROLE TITLE)
+    ========================================================================================= */
+    SELECT 
+      performance_date,
+      'CX and T&S Quality Regional Lead' AS position_role,
+      report_month,
+      CAST(report_year AS STRING) AS report_year,
+      REGEXP_REPLACE(CAST(employee_id AS STRING), r'\.0$', '') AS employee_id,
+      quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1,
+      immediate_manager AS inmediate_supervisor_2,
+      immediate_sr_manager AS inmediate_supervisor_3,
+      program,
+      country,
+      region,
+      kpi AS Metric_Name,
+      business_category,
+      SAFE_CAST(target AS FLOAT64) AS actual_target,
+      SAFE_CAST(target_obtained AS FLOAT64) AS percent_to_target,
+      SAFE_CAST(weight AS FLOAT64) AS metric_weight,
+      SAFE_CAST(metric_points AS FLOAT64) AS metric_points,
+      SAFE_CAST(weight_obtained AS FLOAT64) AS weight_earned,
+      tier,
+      SAFE_CAST(points_final_score AS FLOAT64) AS points_final_score,
+      first_level_security,
+      second_level_security,
+      third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_regional_lead_unpivoted`
+
+    UNION ALL
+
+    /* =========================================================================================
+       5. CX & T&S QUALITY DIRECTOR UNPIVOTED STREAM (STANDARDIZED ROLE TITLE)
+    ========================================================================================= */
+    SELECT 
+      performance_date,
+      'CX and T&S Quality Director' AS position_role,
+      report_month,
+      CAST(report_year AS STRING) AS report_year,
+      REGEXP_REPLACE(CAST(employee_id AS STRING), r'\.0$', '') AS employee_id,
+      quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1,
+      immediate_manager AS inmediate_supervisor_2,
+      immediate_sr_manager AS inmediate_supervisor_3,
+      program,
+      country,
+      region,
+      kpi AS Metric_Name,
+      business_category,
+      SAFE_CAST(target AS FLOAT64) AS actual_target,
+      SAFE_CAST(target_obtained AS FLOAT64) AS percent_to_target,
+      SAFE_CAST(weight AS FLOAT64) AS metric_weight,
+      SAFE_CAST(metric_points AS FLOAT64) AS metric_points,
+      SAFE_CAST(weight_obtained AS FLOAT64) AS weight_earned,
+      tier,
+      SAFE_CAST(points_final_score AS FLOAT64) AS points_final_score,
+      first_level_security,
+      second_level_security,
+      third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_director_unpivoted`
+
+    UNION ALL
+
+    /* =========================================================================================
+       6. TRUST & SAFETY QUALITY ANALYST UNPIVOTED STREAM
+    ========================================================================================= */
+    SELECT 
+      performance_date,
+      position_role,
+      report_month,
+      CAST(report_year AS STRING) AS report_year,
+      REGEXP_REPLACE(CAST(employee_id AS STRING), r'\.0$', '') AS employee_id,
+      quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1,
+      immediate_manager AS inmediate_supervisor_2,
+      immediate_sr_manager AS inmediate_supervisor_3,
+      program,
+      country,
+      region,
+      kpi AS Metric_Name,
+      business_category,
+      SAFE_CAST(target AS FLOAT64) AS actual_target,
+      SAFE_CAST(target_obtained AS FLOAT64) AS percent_to_target,
+      SAFE_CAST(weight AS FLOAT64) AS metric_weight,
+      SAFE_CAST(metric_points AS FLOAT64) AS metric_points,
+      SAFE_CAST(weight_obtained AS FLOAT64) AS weight_earned,
+      tier,
+      SAFE_CAST(points_final_score AS FLOAT64) AS points_final_score,
+      first_level_security,
+      second_level_security,
+      third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_analyst_trustandsafety_unpivoted`
+
+    UNION ALL
+
+    /* =========================================================================================
+       7. TRUST & SAFETY QUALITY TEAM LEAD UNPIVOTED STREAM
+    ========================================================================================= */
+    SELECT 
+      performance_date,
+      position_role,
+      report_month,
+      CAST(report_year AS STRING) AS report_year,
+      REGEXP_REPLACE(CAST(employee_id AS STRING), r'\.0$', '') AS employee_id,
+      quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1,
+      immediate_manager AS inmediate_supervisor_2,
+      immediate_sr_manager AS inmediate_supervisor_3,
+      program,
+      country,
+      region,
+      kpi AS Metric_Name,
+      business_category,
+      SAFE_CAST(target AS FLOAT64) AS actual_target,
+      SAFE_CAST(target_obtained AS FLOAT64) AS percent_to_target,
+      SAFE_CAST(weight AS FLOAT64) AS metric_weight,
+      SAFE_CAST(metric_points AS FLOAT64) AS metric_points,
+      SAFE_CAST(weight_obtained AS FLOAT64) AS weight_earned,
+      tier,
+      SAFE_CAST(points_final_score AS FLOAT64) AS points_final_score,
+      first_level_security,
+      second_level_security,
+      third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_team_lead_trustandsafety_unpivoted`
+
+    UNION ALL
+
+    /* =========================================================================================
+       8. TRUST & SAFETY QUALITY MANAGER UNPIVOTED STREAM
+    ========================================================================================= */
+    SELECT 
+      performance_date,
+      position_role,
+      report_month,
+      CAST(report_year AS STRING) AS report_year,
+      REGEXP_REPLACE(CAST(employee_id AS STRING), r'\.0$', '') AS employee_id,
+      quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1,
+      immediate_manager AS inmediate_supervisor_2,
+      immediate_sr_manager AS inmediate_supervisor_3,
+      program,
+      country,
+      region,
+      kpi AS Metric_Name,
+      business_category,
+      SAFE_CAST(target AS FLOAT64) AS actual_target,
+      SAFE_CAST(target_obtained AS FLOAT64) AS percent_to_target,
+      SAFE_CAST(weight AS FLOAT64) AS metric_weight,
+      SAFE_CAST(metric_points AS FLOAT64) AS metric_points,
+      SAFE_CAST(weight_obtained AS FLOAT64) AS weight_earned,
+      tier,
+      SAFE_CAST(points_final_score AS FLOAT64) AS points_final_score,
+      first_level_security,
+      second_level_security,
+      third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_manager_trustandsafety_unpivoted`
+  )
+
+  /* =========================================================================================
+     FINAL MASTER SELECTION & DYNAMIC POINT CEILING CALCULATION
+     Evaluates metric type to compute available point ceilings (3x multiplier for Productivity; 
+     4x multiplier for standard metrics). Enforces null point ceilings for Yearly Evaluations 
+     outside of June ('JUN', 'JUNE', '6', '06').
+  ========================================================================================= */
+  SELECT 
+    performance_date,
+    position_role,
+    report_month,
+    report_year,
+    employee_id,
+    quality_team_member,
+    inmediate_supervisor_1,
+    inmediate_supervisor_2,
+    inmediate_supervisor_3,
+    program,
+    country,
+    region,
+    Metric_Name,
+    business_category,
+    actual_target,
+    percent_to_target,
+    metric_weight,
+    metric_points,
+    weight_earned,
+    tier,
+    CASE 
+      -- Evaluation Rule: Yearly Evaluations point ceiling active strictly in June
+      WHEN Metric_Name = 'Yearly Evaluations (% to goal)' 
+           AND UPPER(CAST(report_month AS STRING)) NOT IN ('JUNE', 'JUN', '6', '06') THEN NULL
+      
+      WHEN LOWER(Metric_Name) = 'productivity' THEN metric_weight * 3
+      ELSE metric_weight * 4
+    END AS max_points_avaialble,
+    points_final_score,
+    first_level_security,
+    second_level_security,
+    third_level_security
+  FROM consolidated_data;
+
+END;
