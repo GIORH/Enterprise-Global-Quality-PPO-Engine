@@ -1,0 +1,154 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_qualitypercenttogoal_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_lead_trustandsafety_qualitypercenttogoal_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Quality % to Goal' KPI for Trust & Safety 
+                Quality Team Leads. This procedure rolls up individual analyst quality scores into 
+                a team-level average, evaluates team applicability/exemption flags, computes the 
+                Percentage to Goal (PTG), maps performance to standard continuous tiers, and 
+                calculates scorecard impacts based on a 20% master weight.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_qualitypercenttogoal_ETL` AS
+
+  WITH QA_Quality_Source AS (
+    /* =========================================================================================
+       CTE 1: TEAM LEVEL ROLL-UP & EXEMPTION HANDLING
+       Averages quality scores at the Team Lead, program, and regional footprint level.
+       Evaluates analyst-level flags to determine overall team applicability and exemption.
+       Safely calculates average actuals and targets while excluding exempt records to avoid score dilution.
+    ========================================================================================= */
+    SELECT
+      MAX(timestamp) AS timestamp, 
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      report_month, 
+      report_year, 
+      tl_wdid, 
+      tl_name, 
+      tl_manager, 
+      tl_sr_manager, 
+      program, 
+      country, 
+      region,
+      
+      AVG(CASE WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(quality_score_actual AS FLOAT64) END) AS quality_score_actual,
+      AVG(CASE WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(quality_score_target_program AS FLOAT64) END) AS quality_score_target_program,
+      
+      IF(COUNTIF(UPPER(TRIM(qa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS qa_kpi_applicable,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS qa_exempt,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), 'Whole team exempt', NULL) AS quality_notes,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), MAX(qa_reason), NULL) AS qa_reason
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+    GROUP BY report_month, report_year, tl_wdid, tl_name, tl_manager, tl_sr_manager, program, country, region
+  ),
+
+  TL_Quality_PTG AS (
+    /* =========================================================================================
+       CTE 2: METRIC BENCHMARKING & RATIO CALCULATION
+       Injects scorecard metadata (20% master weight, business category) and computes 
+       the team Quality Percentage to Goal (PTG) based on active actuals vs targets.
+    ========================================================================================= */
+    SELECT
+      * EXCEPT(quality_score_target_program),
+      'My Customer' AS qaptg_business_category, 
+      'Quality % to Goal' AS qa_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE quality_score_target_program 
+      END AS quality_score_target_program,
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS quality_weight_master,
+      
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(quality_score_actual, quality_score_target_program) 
+      END AS quality_ptg
+    FROM QA_Quality_Source
+  ),
+
+  TL_Quality_Scores AS (
+    /* =========================================================================================
+       CTE 3: METRIC TIERING & POINT ALLOCATION
+       Maps the team Quality PTG against continuous performance ranges (<90%, <100%, <101%, >=101%) 
+       to assign standard Achievement Tiers and continuous 4-point scale metric points.
+    ========================================================================================= */
+    SELECT
+      *,
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN quality_ptg < 1.00 THEN 'Developing' 
+        WHEN quality_ptg < 1.01 THEN 'Achieving' 
+        WHEN quality_ptg >= 1.01 THEN 'Excelling' 
+        ELSE NULL 
+      END AS quality_achievement_tier,
+      
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 1 
+        WHEN quality_ptg < 1.00 THEN 2 
+        WHEN quality_ptg < 1.01 THEN 3 
+        WHEN quality_ptg >= 1.01 THEN 4 
+        ELSE 0 
+      END AS quality_points_obtained
+    FROM TL_Quality_PTG
+  ),
+
+  TL_Quality_Final_Block AS (
+    /* =========================================================================================
+       CTE 4: WEIGHT DISTRIBUTION & SCORING
+       Translates 4-point scale metric points into quartered weight distributions against the 
+       20% master weight. Generates final numerical points for global scorecard aggregation.
+    ========================================================================================= */
+    SELECT
+      *,
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE (quality_points_obtained / 4) * quality_weight_master 
+      END AS quality_weight_obtained,
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE quality_points_obtained * quality_weight_master 
+      END AS quality_points_final_score
+    FROM TL_Quality_Scores
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: DATASET ASSEMBLY
+     Compiles the finalized Trust & Safety Team Lead Quality dataset, selecting base dimensions 
+     alongside the calculated quality metrics for scorecard ingestion.
+  ========================================================================================= */
+  SELECT 
+    timestamp,
+    date,
+    report_month,
+    report_year,
+    tl_wdid,
+    tl_name,
+    tl_manager,
+    tl_sr_manager,
+    program,
+    country,
+    region,
+
+    qaptg_business_category,
+    qa_kpi,
+    quality_score_actual,
+    quality_score_target_program,
+    quality_notes,
+    qa_kpi_applicable,
+    qa_exempt,
+    qa_reason,
+    quality_weight_master,
+    quality_ptg,
+    quality_achievement_tier,
+    quality_points_obtained,
+    quality_weight_obtained,
+    quality_points_final_score
+
+  FROM TL_Quality_Final_Block;
+
+END;
