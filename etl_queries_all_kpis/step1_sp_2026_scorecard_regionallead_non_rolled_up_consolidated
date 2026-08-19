@@ -1,0 +1,158 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_regionallead_non_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step1_sp_2026_scorecard_regionallead_non_rolled_up_consolidated
+   DESCRIPTION: Master consolidation procedure for Regional QA Lead non-rolled-up metrics (Service 
+                Excellence Index - SEI and Professional Personal Development - PPD). Standardizes 
+                raw timestamps into discrete monthly DATE objects, dynamically calculates discrete 
+                SEI and PPD Percentage to Goal (PTG) ratios, tracks windowed Year-to-Date (YTD) 
+                PPD course volume totals, and assigns continuous performance tiers and scorecard 
+                point contributions.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_regional_lead_non_rolled_up_consolidated` AS
+  
+  /* =========================================================================================
+     CTE 1: RAW DATA PARSING & DISCRETE PTG DECIMAL CALCULATIONS
+     Parses string reporting months into a standard BigQuery DATE type (`parsed_date`) for 
+     windowed YTD partition ordering. Dynamically derives numeric decimal PTG ratios for SEI 
+     (Score / Target) and PPD (Completed / Required).
+  ========================================================================================= */
+  WITH Raw_Data AS (
+    SELECT 
+      *,
+      -- Date parsing for chronological YTD window ordering
+      SAFE.PARSE_DATE('%Y-%m-%d', CONCAT(SAFE_CAST(report_year AS STRING), '-',
+        CASE LOWER(TRIM(report_month))
+          WHEN 'january' THEN '01' WHEN 'february' THEN '02' WHEN 'march' THEN '03' 
+          WHEN 'april' THEN '04' WHEN 'may' THEN '05' WHEN 'june' THEN '06' 
+          WHEN 'july' THEN '07' WHEN 'august' THEN '08' WHEN 'september' THEN '09' 
+          WHEN 'october' THEN '10' WHEN 'november' THEN '11' WHEN 'december' THEN '12'
+          ELSE LPAD(TRIM(report_month), 2, '0') 
+        END, '-01')) AS parsed_date,
+
+      -- Dynamic calculation of SEI PTG decimal (sei_score / sei_target)
+      SAFE_DIVIDE(
+        SAFE_CAST(REPLACE(sei_score, '%', '') AS FLOAT64),
+        SAFE_CAST(REPLACE(sei_target, '%', '') AS FLOAT64)
+      ) AS sei_ptg_decimal,
+      
+      -- Dynamic calculation of PPD PTG decimal (courses_completed / courses_required)
+      SAFE_DIVIDE(
+        SAFE_CAST(courses_completed AS FLOAT64),
+        SAFE_CAST(courses_required AS FLOAT64)
+      ) AS ppd_ptg_decimal
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qareglds_raw`
+  ),
+
+  /* =========================================================================================
+     CTE 2: YTD WINDOWED ACCUMULATION
+     Calculates running Year-to-Date (YTD) windowed totals for PPD completed and required 
+     course volumes partitioned by Regional Lead Workday ID and report year.
+  ========================================================================================= */
+  Calculos_YTD AS (
+    SELECT
+      *,
+      -- Cumulative YTD calculations for PPD
+      SUM(SAFE_CAST(courses_completed AS FLOAT64)) OVER (PARTITION BY lead_wdid, report_year ORDER BY parsed_date) AS courses_completed_ytd,
+      SUM(SAFE_CAST(courses_required AS FLOAT64)) OVER (PARTITION BY lead_wdid, report_year ORDER BY parsed_date) AS courses_required_ytd
+    FROM Raw_Data
+  ),
+
+  /* =========================================================================================
+     CTE 3: METRIC TIERING & POINT ALLOCATION
+     Evaluates dynamic SEI decimal ratios against standard performance thresholds (<90%, <100%, 
+     <101%, >=101%) for 15% weight. Evaluates PPD completion ratios against standard thresholds 
+     (<50%, <91%, <=100%, >100%) for 10% weight.
+  ========================================================================================= */
+  Calculos_Metricas AS (
+    SELECT
+      *,
+      /* --- SERVICE EXCELLENCE INDEX (SEI) BLOCK --- */
+      'Service Excellence Index' AS sei_kpi,
+      'My Customer' AS sei_business_category,
+      0.15 AS sei_weight,
+      CASE 
+        WHEN sei_ptg_decimal < 0.90 THEN 'Improvement Required'
+        WHEN sei_ptg_decimal < 1.00 THEN 'Developing'
+        WHEN sei_ptg_decimal < 1.01 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS sei_achievement_category,
+      CASE 
+        WHEN sei_ptg_decimal < 0.90 THEN 1
+        WHEN sei_ptg_decimal < 1.00 THEN 2
+        WHEN sei_ptg_decimal < 1.01 THEN 3
+        ELSE 4
+      END AS sei_points_obtained,
+
+      /* --- PERSONAL PROFESSIONAL DEVELOPMENT (PPD) BLOCK --- */
+      'PPD' AS ppd_kpi,
+      'My Team' AS ppd_business_category,
+      0.10 AS ppd_weight,
+      
+      -- Threshold mapping aligned with Lead/Manager standards (IR <50%, Dev 50-90.99%, Ach 91-100%, Exc >100%)
+      CASE 
+        WHEN ppd_ptg_decimal < 0.50 THEN 'Improvement Required'
+        WHEN ppd_ptg_decimal < 0.91 THEN 'Developing'
+        WHEN ppd_ptg_decimal <= 1.00 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS ppd_achievement_category,
+      CASE 
+        WHEN ppd_ptg_decimal < 0.50 THEN 1
+        WHEN ppd_ptg_decimal < 0.91 THEN 2
+        WHEN ppd_ptg_decimal <= 1.00 THEN 3
+        ELSE 4
+      END AS ppd_points_obtained
+    FROM Calculos_YTD
+  )
+
+  /* =========================================================================================
+     FINAL MASTER SELECTION
+     Projects Regional QA Lead dimensions, formats percentage strings for reporting, and 
+     calculates earned weights and final scorecard point contributions for SEI and PPD.
+  ========================================================================================= */
+  SELECT 
+    -- Identity Block (Replaces raw timestamp with short DATE object YYYY-MM-01)
+    pk, 
+    parsed_date AS timestamp,
+    submitter_email, 
+    report_month, 
+    report_year, 
+    region, 
+    role, 
+    lead_wdid, 
+    lead_name,
+
+    -- Final SEI Block (Standard 11 columns with formatted string percentage)
+    sei_kpi, 
+    sei_business_category, 
+    sei_weight, 
+    sei_score, 
+    sei_target, 
+    FORMAT('%.2f%%', sei_ptg_decimal * 100) AS sei_ptg, 
+    sei_achievement_category,
+    sei_points_obtained,
+    (CAST(sei_points_obtained AS FLOAT64) / 4) * 0.15 AS sei_weight_obtained,
+    CAST(sei_points_obtained AS FLOAT64) * 0.15 AS sei_points_final_score,
+    sei_comments,
+
+    -- Final PPD Block (Standard 13 columns with YTD cumulative fields)
+    ppd_kpi, 
+    ppd_business_category, 
+    ppd_weight, 
+    1.0 AS ppd_target,                                   -- Explicit 1.0 Target (100%)
+    courses_completed, 
+    courses_completed_ytd,
+    courses_required, 
+    courses_required_ytd,
+    FORMAT('%.2f%%', ppd_ptg_decimal * 100) AS ppd_ptg, -- Formatted completed course percentage
+    ppd_achievement_category,
+    ppd_points_obtained,
+    (CAST(ppd_points_obtained AS FLOAT64) / 4) * 0.10 AS ppd_weight_obtained,
+    CAST(ppd_points_obtained AS FLOAT64) * 0.10 AS ppd_points_final_score,
+    ppd_comments
+
+  FROM Calculos_Metricas;
+
+END;
