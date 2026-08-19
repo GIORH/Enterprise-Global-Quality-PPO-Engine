@@ -1,0 +1,191 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_servicedelivery_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_lead_trustandsafety_servicedelivery_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Service Delivery' KPI for Trust & Safety 
+                Quality Team Leads (10% Weight). This procedure rolls up team-level operational 
+                metrics across two distinct operational pillars: QA Evaluations Completed and 
+                Accepted Appeals Performance. It safely handles component-level exemptions, 
+                averages active percentages without dilution, maps performance to standard 
+                continuous tiers, and calculates the final weighted scorecard impacts.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_servicedelivery_ETL` AS
+
+  WITH TL_Service_Delivery_Source AS (
+    /* =========================================================================================
+       CTE 1: TEAM LEVEL AGGREGATION & EXEMPTION CONTROL
+       Aggregates raw evaluation volumes and appeal targets at the Team Lead, program, and regional 
+       level. Evaluates analyst-level applicability and exemption flags to establish overall team 
+       flags, safely summing actuals and targets while excluding exempt records to avoid score dilution.
+    ========================================================================================= */
+    SELECT
+      MAX(timestamp) AS timestamp, 
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      report_month, 
+      report_year, 
+      tl_wdid, 
+      tl_name, 
+      tl_manager, 
+      tl_sr_manager, 
+      program, 
+      country, 
+      region,
+      
+      -- 1. QA Evaluations Block (Production)
+      SUM(CASE WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' OR UPPER(TRIM(prod_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(qa_evals_completed AS FLOAT64) END) AS sd_qa_evals_completed,
+      SUM(CASE WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' OR UPPER(TRIM(prod_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(qa_evals_target AS FLOAT64) END) AS sd_qa_evals_target,
+      
+      -- 2. Accepted Appeals Target Program
+      SUM(CASE WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(aa_score_target_program AS FLOAT64) END) AS sd_aa_score_target_program,
+      
+      -- Team-level control flags for applicability and exemptions
+      IF(COUNTIF(UPPER(TRIM(prod_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS sd_kpi_applicable,
+      IF(COUNTIF(UPPER(TRIM(prod_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS sd_exempt,
+      IF(COUNTIF(UPPER(TRIM(aa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS sd_aa_kpi_applicable,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS sd_aa_exempt,
+      MAX(notes_prod) AS sd_notes
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+    GROUP BY report_month, report_year, tl_wdid, tl_name, tl_manager, tl_sr_manager, program, country, region
+  ),
+
+  TL_Service_Delivery_Percentages AS (
+    /* =========================================================================================
+       CTE 2: PILLAR RATIO CALCULATION & METADATA INJECTION
+       Injects standard metric metadata (10% master weight, 1.00 target). Calculates individual 
+       completion percentages for both active pillars: QA Evaluations Completed (Completed / Target) 
+       and Accepted Appeals Performance (Appeals Target / QA Evals Target).
+    ========================================================================================= */
+    SELECT
+      *,
+      'My Business' AS sd_business_category, 
+      'Service Delivery' AS sd_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(sd_kpi_applicable)) = 'NO' OR UPPER(TRIM(sd_exempt)) = 'YES' THEN NULL 
+        ELSE 0.10 
+      END AS sd_weight_master,
+      CASE 
+        WHEN UPPER(TRIM(sd_kpi_applicable)) = 'NO' OR UPPER(TRIM(sd_exempt)) = 'YES' THEN NULL 
+        ELSE 1.00 
+      END AS sd_target_master,
+      
+      -- Percentage 1: Evaluations Completion Ratio
+      CASE 
+        WHEN UPPER(TRIM(sd_kpi_applicable)) = 'NO' OR UPPER(TRIM(sd_exempt)) = 'YES' THEN NULL
+        ELSE SAFE_DIVIDE(sd_qa_evals_completed, sd_qa_evals_target)
+      END AS sd_avg_evals_completed,
+      
+      -- Percentage 2: Accepted Appeals Performance Ratio
+      CASE 
+        WHEN UPPER(TRIM(sd_aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(sd_aa_exempt)) = 'YES' THEN NULL
+        ELSE SAFE_DIVIDE(sd_aa_score_target_program, sd_qa_evals_target)
+      END AS sd_avg_accepted_appeals
+    FROM TL_Service_Delivery_Source
+  ),
+
+  TL_Service_Delivery_PTG AS (
+    /* =========================================================================================
+       CTE 3: DYNAMIC PERCENTAGE TO GOAL (PTG) AGGREGATION
+       Averages the active pillar percentages to generate the final Service Delivery PTG. 
+       Uses a dynamic denominator count to protect the final score from artificial dilution 
+       when one component is exempt or missing.
+    ========================================================================================= */
+    SELECT
+      *,
+      CASE 
+        WHEN sd_avg_evals_completed IS NULL AND sd_avg_accepted_appeals IS NULL THEN NULL
+        ELSE SAFE_DIVIDE(
+          IFNULL(sd_avg_evals_completed, 0) + IFNULL(sd_avg_accepted_appeals, 0), 
+          (CASE WHEN sd_avg_evals_completed IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN sd_avg_accepted_appeals IS NOT NULL THEN 1 ELSE 0 END)
+        ) 
+      END AS sd_ptg
+    FROM TL_Service_Delivery_Percentages
+  ),
+
+  TL_Service_Delivery_Scores AS (
+    /* =========================================================================================
+       CTE 4: METRIC TIERING & POINT ALLOCATION
+       Maps the aggregated Service Delivery PTG against continuous performance ranges (<90%, 
+       <100%, <101%, >=101%) to assign official Achievement Tiers and continuous 4-point scale metric points.
+    ========================================================================================= */
+    SELECT
+      *,
+      CASE 
+        WHEN sd_ptg IS NULL THEN NULL 
+        WHEN sd_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN sd_ptg < 1.00 THEN 'Developing' 
+        WHEN sd_ptg < 1.01 THEN 'Achieving' 
+        WHEN sd_ptg >= 1.01 THEN 'Excelling' 
+        ELSE NULL 
+      END AS sd_achievement_tier,
+      
+      CASE 
+        WHEN sd_ptg IS NULL THEN NULL 
+        WHEN sd_ptg < 0.90 THEN 1 
+        WHEN sd_ptg < 1.00 THEN 2 
+        WHEN sd_ptg < 1.01 THEN 3 
+        WHEN sd_ptg >= 1.01 THEN 4 
+        ELSE 0 
+      END AS sd_metric_points
+    FROM TL_Service_Delivery_PTG
+  ),
+
+  TL_Service_Delivery_Final_Block AS (
+    /* =========================================================================================
+       CTE 5: WEIGHT DISTRIBUTION & FINAL SCORE CALCULATION
+       Translates 4-point scale metric points into quartered fractional weights against the 10% 
+       master weight. Calculates final numerical points required for global scorecard aggregation.
+    ========================================================================================= */
+    SELECT
+      *,
+      CASE 
+        WHEN sd_metric_points IS NULL THEN NULL 
+        ELSE (sd_metric_points / 4) * sd_weight_master 
+      END AS sd_weight_obtained,
+      CASE 
+        WHEN sd_metric_points IS NULL THEN NULL 
+        ELSE sd_metric_points * sd_weight_master 
+      END AS sd_points_final_score
+    FROM TL_Service_Delivery_Scores
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: DATASET ASSEMBLY
+     Compiles the finalized Trust & Safety Team Lead Service Delivery dataset, selecting 
+     base dimensions alongside the calculated service delivery metrics for scorecard ingestion.
+  ========================================================================================= */
+  SELECT 
+    timestamp,
+    date,
+    report_month,
+    report_year,
+    tl_wdid,
+    tl_name,
+    tl_manager,
+    tl_sr_manager,
+    program,
+    country,
+    region,
+
+    sd_business_category,
+    sd_kpi,
+    sd_weight_master,
+    sd_target_master,
+    sd_qa_evals_completed,
+    sd_qa_evals_target,
+    sd_avg_evals_completed,
+    sd_aa_score_target_program,
+    sd_avg_accepted_appeals,
+    sd_ptg,
+    sd_achievement_tier,
+    sd_metric_points,
+    sd_weight_obtained,
+    sd_points_final_score,
+    sd_notes,
+    sd_kpi_applicable,
+    sd_exempt
+
+  FROM TL_Service_Delivery_Final_Block;
+
+END;
