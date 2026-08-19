@@ -1,0 +1,380 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_analyst_trustandsafety_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step1_sp_2026_scorecard_analyst_trustandsafety_rolled_up_consolidated
+   DESCRIPTION: Master consolidated scorecard procedure for Trust & Safety CX Quality Analysts. 
+                Integrates and evaluates three core operational metric blocks: Accepted Appeals 
+                % to Goal (25% Weight), Quality % to Goal (20% Weight), and Productivity (20% Weight). 
+                Dynamically computes multi-component productivity averages without score dilution, 
+                maps performance ratios to standard continuous tiers, and calculates final weighted 
+                scorecard impacts at the individual analyst grain.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_analyst_trustandsafety_rolled_up_consolidated` AS
+
+  /* ===============================================================================================
+     BASE LAYER: EXTRACTION & DIMENSION STANDARDIZATION
+     Extracts operational actuals, targets, and KPI control flags at the individual Analyst grain.
+     Casts discrete volumes into FLOAT64 formats and parses reporting timestamps into BigQuery DATEs.
+  =============================================================================================== */
+  WITH Analyst_Base AS (
+    SELECT
+      -- Metadata & Dimensions
+      timestamp,
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      'T&S Quality Analyst' AS role,
+      report_month,
+      report_year,
+      tl_wdid,
+      tl_name,
+      tl_manager,
+      tl_sr_manager,
+      tm_wdid,
+      tm_name,
+      program,
+      country,
+      region,
+
+      -- Productivity Metrics Inputs
+      SAFE_CAST(qa_evals_completed AS FLOAT64) AS qa_evals_completed,
+      SAFE_CAST(qa_evals_target AS FLOAT64) AS qa_evals_target,
+      SAFE_CAST(appeals_handled AS FLOAT64) AS appeals_handled,
+      SAFE_CAST(appeals_handled_target AS FLOAT64) AS appeals_handled_target,
+      SAFE_CAST(rca_handled AS FLOAT64) AS rca_handled,
+      SAFE_CAST(rca_target AS FLOAT64) AS rca_target,
+
+      -- Accepted Appeals Metrics Inputs
+      SAFE_CAST(aa_actual AS FLOAT64) AS aa_actual,
+      SAFE_CAST(aa_score_target_program AS FLOAT64) AS aa_score_target_program,
+
+      -- Quality Metrics Inputs
+      SAFE_CAST(quality_score_actual AS FLOAT64) AS quality_score_actual,
+      SAFE_CAST(quality_score_target_program AS FLOAT64) AS quality_score_target_program,
+
+      -- KPI Applicability & Exemption Flags
+      prod_kpi_applicable,
+      prod_exempt,
+      qa_evals_na,
+      appeals_na,
+      rca_na,
+      aa_kpi_applicable,
+      aa_exempt,
+      qa_kpi_applicable,
+      qa_exempt
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+  ),
+
+  /* ===============================================================================================
+     1. METRIC LAYER: ACCEPTED APPEALS SCORING (25% WEIGHT)
+     Calculates pre-goal performance ratios, indexes the Percentage to Goal (PTG) against the 
+     0.975 target baseline, maps scores to standard tiers (<85%, <95%, <96%, >=96%), and computes 
+     quartered weight distributions.
+  =============================================================================================== */
+  Analyst_Appeals AS (
+    SELECT
+      *,
+      'My Customer' AS accepted_appeals_business_category, 
+      'Accepted Appeals % to Goal' AS accepted_appeals_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.25 
+      END AS accepted_appeals_weight_master,
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.975 
+      END AS accepted_appeals_target_master,
+      
+      -- Pre-goal performance ratio
+      SAFE_DIVIDE(
+        aa_score_target_program - aa_actual, 
+        aa_score_target_program
+      ) AS accepted_appeals_performance_before_goal,
+      
+      -- Final Performance to Goal (PTG) indexed to 0.975 master target
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(aa_score_target_program - aa_actual, aa_score_target_program) / 0.975 
+      END AS accepted_appeals_ptg
+    FROM Analyst_Base
+  ),
+
+  Analyst_Appeals_Scores AS (
+    SELECT
+      *,
+      -- Continuous tier classification
+      CASE 
+        WHEN accepted_appeals_ptg IS NULL THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 'Improvement Required' 
+        WHEN accepted_appeals_ptg < 0.95 THEN 'Developing' 
+        WHEN accepted_appeals_ptg < 0.96 THEN 'Achieving' 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 'Excelling' 
+        ELSE NULL 
+      END AS accepted_appeals_achievement_tier,
+
+      -- Metric point allocation (4-point scale)
+      CASE 
+        WHEN accepted_appeals_ptg IS NULL THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 1 
+        WHEN accepted_appeals_ptg < 0.95 THEN 2 
+        WHEN accepted_appeals_ptg < 0.96 THEN 3 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 4 
+        ELSE 0 
+      END AS accepted_appeals_points_obtained
+    FROM Analyst_Appeals
+  ),
+
+  Analyst_Appeals_Final AS (
+    SELECT
+      *,
+      -- Final earned weight and score calculation
+      CASE 
+        WHEN accepted_appeals_points_obtained IS NULL THEN NULL 
+        ELSE (accepted_appeals_points_obtained / 4) * accepted_appeals_weight_master 
+      END AS accepted_appeals_weight_obtained,
+
+      CASE 
+        WHEN accepted_appeals_points_obtained IS NULL THEN NULL 
+        ELSE accepted_appeals_points_obtained * accepted_appeals_weight_master 
+      END AS accepted_appeals_points_final_score
+    FROM Analyst_Appeals_Scores
+  ),
+
+  /* ===============================================================================================
+     2. METRIC LAYER: QUALITY PERCENT TO GOAL SCORING (20% WEIGHT)
+     Computes the Quality Percentage to Goal ratio (Actual / Target), maps results to standard 
+     continuous tiers (<90%, <100%, <101%, >=101%), and calculates the weighted score impact.
+  =============================================================================================== */
+  Analyst_Quality AS (
+    SELECT
+      * EXCEPT(quality_score_target_program),
+      'My Customer' AS qaptg_business_category, 
+      'Quality % to Goal' AS qa_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE quality_score_target_program 
+      END AS quality_score_target_program,
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS quality_weight_master,
+      
+      -- Quality Percentage to Goal calculation
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(quality_score_actual, quality_score_target_program) 
+      END AS quality_ptg
+    FROM Analyst_Appeals_Final
+  ),
+
+  Analyst_Quality_Scores AS (
+    SELECT
+      *,
+      -- Continuous tier classification
+      CASE 
+        WHEN quality_ptg IS NULL THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN quality_ptg < 1.00 THEN 'Developing' 
+        WHEN quality_ptg < 1.01 THEN 'Achieving' 
+        WHEN quality_ptg >= 1.01 THEN 'Excelling' 
+        ELSE NULL 
+      END AS quality_achievement_tier,
+
+      -- Metric point allocation (4-point scale)
+      CASE 
+        WHEN quality_ptg IS NULL THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 1 
+        WHEN quality_ptg < 1.00 THEN 2 
+        WHEN quality_ptg < 1.01 THEN 3 
+        WHEN quality_ptg >= 1.01 THEN 4 
+        ELSE 0 
+      END AS quality_points_obtained
+    FROM Analyst_Quality
+  ),
+
+  Analyst_Quality_Final AS (
+    SELECT
+      *,
+      -- Final earned weight and score calculation
+      CASE 
+        WHEN quality_points_obtained IS NULL THEN NULL 
+        ELSE (quality_points_obtained / 4) * quality_weight_master 
+      END AS quality_weight_obtained,
+
+      CASE 
+        WHEN quality_points_obtained IS NULL THEN NULL 
+        ELSE quality_points_obtained * quality_weight_master 
+      END AS quality_points_final_score
+    FROM Analyst_Quality_Scores
+  ),
+
+  /* ===============================================================================================
+     3. METRIC LAYER: PRODUCTIVITY SCORING (20% WEIGHT)
+     Evaluates up to three operational sub-components (Evaluations, Appeals Handled, RPC/RCA). 
+     Calculates individual completion ratios and averages active pillars dynamically to prevent 
+     score dilution. Maps the aggregated PTG to a 3-tier scale (1 to 3 points) against a 20% weight.
+  =============================================================================================== */
+  Analyst_Productivity AS (
+    SELECT
+      *,
+      'My Business' AS productivity_business_category, 
+      'Productivity' AS productivity_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' OR UPPER(TRIM(prod_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS productivity_weight_master,
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' OR UPPER(TRIM(prod_exempt)) = 'YES' THEN NULL 
+        ELSE 1.00 
+      END AS productivity_target_master,
+
+      -- Component 1: Evaluations PTG
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(prod_exempt)) = 'YES' 
+          OR UPPER(TRIM(qa_evals_na)) = 'NO' THEN NULL 
+        ELSE SAFE_DIVIDE(qa_evals_completed, qa_evals_target) 
+      END AS evals_ptg,
+
+      -- Component 2: Appeals Handled PTG
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(prod_exempt)) = 'YES' 
+          OR UPPER(TRIM(appeals_na)) = 'NO' THEN NULL 
+        ELSE SAFE_DIVIDE(appeals_handled, appeals_handled_target) 
+      END AS appeals_ptg,
+
+      -- Component 3: RPC PTG
+      CASE 
+        WHEN UPPER(TRIM(prod_kpi_applicable)) = 'NO' 
+          OR UPPER(TRIM(prod_exempt)) = 'YES' 
+          OR UPPER(TRIM(rca_na)) = 'NO' THEN NULL 
+        ELSE SAFE_DIVIDE(rca_handled, rca_target) 
+      END AS rpc_ptg
+    FROM Analyst_Quality_Final
+  ),
+
+  Analyst_Productivity_PTG AS (
+    SELECT
+      *,
+      -- Dynamic average protecting against exempt pillar dilution
+      SAFE_DIVIDE(
+        (IFNULL(evals_ptg, 0) + IFNULL(appeals_ptg, 0) + IFNULL(rpc_ptg, 0)),
+        (
+          CASE WHEN evals_ptg IS NOT NULL THEN 1 ELSE 0 END + 
+          CASE WHEN appeals_ptg IS NOT NULL THEN 1 ELSE 0 END + 
+          CASE WHEN rpc_ptg IS NOT NULL THEN 1 ELSE 0 END
+        )
+      ) AS productivity_ptg
+    FROM Analyst_Productivity
+  ),
+
+  Analyst_Productivity_Scores AS (
+    SELECT
+      *,
+      -- Continuous 3-tier performance classification
+      CASE 
+        WHEN productivity_ptg IS NULL THEN NULL 
+        WHEN productivity_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN productivity_ptg < 1.00 THEN 'Developing' 
+        WHEN productivity_ptg >= 1.00 THEN 'Achieving' 
+        ELSE NULL 
+      END AS productivity_achievement_tier,
+
+      -- Point allocation aligned with 3-tier scale
+      CASE 
+        WHEN productivity_ptg IS NULL THEN NULL 
+        WHEN productivity_ptg < 0.90 THEN 1 
+        WHEN productivity_ptg < 1.00 THEN 2 
+        WHEN productivity_ptg >= 1.00 THEN 3 
+        ELSE 0 
+      END AS productivity_points_obtained
+    FROM Analyst_Productivity_PTG
+  ),
+
+  Analyst_Productivity_Final_Block AS (
+    SELECT
+      *,
+      -- Final earned weight (proportional thirds) and score calculation
+      CASE 
+        WHEN productivity_points_obtained IS NULL THEN NULL 
+        ELSE (productivity_points_obtained / 3) * productivity_weight_master 
+      END AS productivity_weight_earned,
+
+      CASE 
+        WHEN productivity_points_obtained IS NULL THEN NULL 
+        ELSE productivity_points_obtained * productivity_weight_master 
+      END AS productivity_points_final_score
+    FROM Analyst_Productivity_Scores
+  )
+
+  /* ===============================================================================================
+     FINAL MASTER SELECTION
+     Compiles the finalized Trust & Safety Analyst rolled-up scorecard dataset, projecting base 
+     dimensions alongside the calculated Accepted Appeals, Quality, and Productivity metric blocks.
+  =============================================================================================== */
+  SELECT 
+    -- Metadata & Dimensions
+    timestamp,
+    date,
+    report_month,
+    report_year,
+    role,
+    tl_wdid,
+    tl_name,
+    tl_manager,
+    tl_sr_manager,
+    tm_wdid,
+    tm_name,
+    program,
+    country,
+    region,
+
+    -- Accepted Appeals Block
+    accepted_appeals_business_category,
+    accepted_appeals_kpi,
+    aa_actual,
+    aa_score_target_program,
+    accepted_appeals_weight_master,
+    accepted_appeals_target_master,
+    accepted_appeals_performance_before_goal,
+    accepted_appeals_ptg,
+    accepted_appeals_achievement_tier,
+    accepted_appeals_points_obtained,
+    accepted_appeals_weight_obtained,
+    accepted_appeals_points_final_score,
+
+    -- Quality Block
+    qaptg_business_category,
+    qa_kpi,
+    quality_score_actual,
+    quality_score_target_program,
+    quality_weight_master,
+    quality_ptg,
+    quality_achievement_tier,
+    quality_points_obtained,
+    quality_weight_obtained,
+    quality_points_final_score,
+
+    -- Productivity Block
+    productivity_business_category,
+    productivity_kpi,
+    qa_evals_completed,
+    qa_evals_target,
+    appeals_handled,
+    appeals_handled_target,
+    rca_handled,
+    rca_target,
+    productivity_weight_master,
+    productivity_target_master,
+    productivity_ptg,
+    productivity_achievement_tier,
+    productivity_points_obtained,
+    productivity_weight_earned,
+    productivity_points_final_score
+
+  FROM Analyst_Productivity_Final_Block;
+
+END;
