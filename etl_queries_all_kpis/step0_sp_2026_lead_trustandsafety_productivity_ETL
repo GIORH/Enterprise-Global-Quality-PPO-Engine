@@ -1,0 +1,212 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_productivity_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_lead_trustandsafety_productivity_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Productivity' KPI for Trust & Safety 
+                Quality Team Leads. This procedure dynamically evaluates two operational pillars 
+                (Calibrations and Evaluations). It safely handles granular exemption flags, 
+                averages the active pillars without dilution, maps the final percentage to a 
+                customized 3-tier scale (1 to 3 points), and distributes a 10% scorecard weight.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_productivity_ETL` AS
+
+  WITH Productivity_Source AS (
+    /* =========================================================================================
+       CTE 1: DATA SANITIZATION & EXTRACTION
+       Extracts raw productivity data, normalizes primary keys and temporal dimensions, and 
+       casts discrete operational counts (evaluations, calibrations) into FLOAT64 formats to 
+       facilitate downstream decimal calculations.
+    ========================================================================================= */
+    SELECT 
+      LOWER(TRIM(pk)) AS pk_normalized, 
+      timestamp,
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      report_month, 
+      report_year, 
+      tl_wdid, 
+      tl_name, 
+      tl_manager, 
+      tl_sr_manager, 
+      program, 
+      country, 
+      region,
+      SAFE_CAST(qa_count AS FLOAT64) AS qa_count, 
+      SAFE_CAST(ts_calibrations_completed AS FLOAT64) AS ts_calibrations_completed,
+      SAFE_CAST(ts_calibrations_required AS FLOAT64) AS ts_calibrations_required, 
+      SAFE_CAST(ts_evals_completed AS FLOAT64) AS ts_evals_completed,
+      SAFE_CAST(ts_evals_target AS FLOAT64) AS ts_evals_target, 
+      qa_cal_na,
+      qa_evals_na, 
+      qa_cal_exempt,
+      qa_evals_exempt,
+      CAST(ts_exemption_reason AS STRING) AS ts_exemption_reason, 
+      notes
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_global_ts_qa_tl_productivity_raw`
+  ),
+
+  TL_Productivity_PTG AS (
+    /* =========================================================================================
+       CTE 2: PILLAR RATIO CALCULATION & EXEMPTION HANDLING
+       Computes the individual Percentage to Goal (PTG) for both Calibrations and Evaluations. 
+       Strictly honors component-level exemption and Not Applicable (NA) flags. Safely nullifies 
+       evaluations when both targets and completed volumes are absolute zeroes.
+    ========================================================================================= */
+    SELECT
+      *,
+      'My Business' AS productivity_business_category, 
+      'Productivity' AS productivity_kpi, 
+      
+      -- Calculates Calibration PTG with granular exemption control
+      CASE 
+        WHEN UPPER(TRIM(qa_cal_exempt)) = 'YES' OR UPPER(TRIM(qa_cal_na)) = 'NO' THEN NULL 
+        ELSE SAFE_DIVIDE(ts_calibrations_completed, ts_calibrations_required) 
+      END AS calibrations_ptg,
+      
+      -- Calculates Evaluation PTG with granular exemption and zero-target protection
+      CASE 
+        WHEN UPPER(TRIM(qa_evals_exempt)) = 'YES' OR UPPER(TRIM(qa_evals_na)) = 'NO' THEN NULL
+        WHEN ts_evals_completed = 0 AND ts_evals_target = 0 THEN NULL 
+        ELSE SAFE_DIVIDE(ts_evals_completed, ts_evals_target) 
+      END AS evaluations_ptg
+    FROM Productivity_Source
+  ),
+
+  TL_Productivity_Master_Weight AS (
+    /* =========================================================================================
+       CTE 3: SCORECARD METADATA INJECTION
+       Allocates the master target (1.00) and metric weight (10%). Dynamically nullifies both 
+       metadata fields if all underlying operational pillars are flagged as exempt or inapplicable.
+    ========================================================================================= */
+    SELECT
+      *,
+      -- Assigns Master Target (Nullifies if completely exempt)
+      CASE 
+        WHEN calibrations_ptg IS NULL AND evaluations_ptg IS NULL THEN NULL 
+        ELSE 1.00 
+      END AS productivity_target_master,
+      
+      -- Assigns 10% Master Weight (Nullifies if completely exempt)
+      CASE 
+        WHEN calibrations_ptg IS NULL AND evaluations_ptg IS NULL THEN NULL 
+        ELSE 0.10 
+      END AS productivity_weight_master
+    FROM TL_Productivity_PTG
+  ),
+
+  TL_Productivity_Final AS (
+    /* =========================================================================================
+       CTE 4: DYNAMIC SCORE AGGREGATION
+       Averages the computed pillar ratios to formulate the final aggregated Productivity PTG. 
+       Utilizes a dynamic denominator to ensure the overall score is not diluted by exempt 
+       or missing operational pillars.
+    ========================================================================================= */
+    SELECT
+      *,
+      -- Dynamic average protecting against exempt pillar dilution
+      CASE 
+        WHEN calibrations_ptg IS NULL AND evaluations_ptg IS NULL THEN NULL
+        ELSE SAFE_DIVIDE(
+          IFNULL(calibrations_ptg, 0) + IFNULL(evaluations_ptg, 0), 
+          (CASE WHEN calibrations_ptg IS NOT NULL THEN 1 ELSE 0 END + CASE WHEN evaluations_ptg IS NOT NULL THEN 1 ELSE 0 END)
+        ) 
+      END AS productivity_ptg
+    FROM TL_Productivity_Master_Weight
+  ),
+
+  TL_Productivity_Scores AS (
+    /* =========================================================================================
+       CTE 5: METRIC TIERING & POINT ALLOCATION
+       Evaluates the final aggregated productivity score against a continuous 3-tier performance 
+       scale to assign the Achievement Tier and standard Metric Points (1 to 3 scale).
+    ========================================================================================= */
+    SELECT
+      *,
+      -- Continuous tier mapping to prevent evaluation gaps
+      CASE 
+        WHEN productivity_ptg IS NULL THEN NULL 
+        WHEN productivity_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN productivity_ptg < 1.00 THEN 'Developing' 
+        WHEN productivity_ptg >= 1.00 THEN 'Achieving' 
+        ELSE NULL 
+      END AS productivity_achievement_tier,
+      
+      -- Metric point assignment aligned with the customized 3-tier scale
+      CASE 
+        WHEN productivity_ptg IS NULL THEN NULL 
+        WHEN productivity_ptg < 0.90 THEN 1 
+        WHEN productivity_ptg < 1.00 THEN 2 
+        WHEN productivity_ptg >= 1.00 THEN 3 
+        ELSE 0 
+      END AS productivity_points_obtained
+    FROM TL_Productivity_Final
+  ),
+
+  TL_Productivity_Block AS (
+    /* =========================================================================================
+       CTE 6: WEIGHT DISTRIBUTION & SCORING
+       Computes the definitive scorecard impacts. Translates the 3-point scale into proportional 
+       thirds (33.3%, 66.6%, 100%) against the 10% master weight to determine the earned fraction 
+       and numerical points required for global aggregation.
+    ========================================================================================= */
+    SELECT
+      *,
+      -- Converts points into a proportional weight fraction (divided by 3)
+      CASE 
+        WHEN productivity_points_obtained IS NULL THEN NULL 
+        ELSE (productivity_points_obtained / 3) * productivity_weight_master 
+      END AS productivity_weight_earned,
+      
+      -- Computes numerical points aligned with the master weight scale
+      CASE 
+        WHEN productivity_points_obtained IS NULL THEN NULL 
+        ELSE productivity_points_obtained * productivity_weight_master 
+      END AS productivity_points_final_score
+    FROM TL_Productivity_Scores
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: DATASET ASSEMBLY
+     Compiles the finalized Trust & Safety Team Lead Productivity dataset, isolating the 
+     calculated dimensions and scoring metrics for structured scorecard ingestion.
+  ========================================================================================= */
+  SELECT 
+    timestamp,
+    date,
+    report_month,
+    report_year,
+    tl_wdid,
+    tl_name,
+    tl_manager,
+    tl_sr_manager,
+    program,
+    country,
+    region,
+
+    productivity_business_category,
+    productivity_kpi,
+    qa_count,
+    ts_calibrations_completed,
+    ts_calibrations_required,
+    ts_evals_completed,
+    ts_evals_target,
+    calibrations_ptg,
+    evaluations_ptg,
+    productivity_weight_master,
+    productivity_target_master,
+    productivity_ptg,
+    qa_cal_na,
+    qa_evals_na,
+    qa_cal_exempt,
+    qa_evals_exempt,
+    ts_exemption_reason,
+    notes,
+    productivity_achievement_tier,
+    productivity_points_obtained,
+    productivity_weight_earned,
+    productivity_points_final_score
+
+  FROM TL_Productivity_Block;
+
+END;
