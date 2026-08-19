@@ -1,0 +1,157 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_lead_trustandsafety_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step1_sp_2026_scorecard_lead_trustandsafety_rolled_up_consolidated
+   DESCRIPTION: Master consolidation procedure for the Trust & Safety CX Quality Team Lead Scorecard. 
+                Integrates four primary metric ETL components (Accepted Appeals, Quality % to Goal, 
+                Productivity, and Service Delivery) using incremental COALESCE logic and FULL OUTER 
+                JOINs. This guarantees zero record loss across all operational metrics while maintaining 
+                strict geographical and hierarchical key alignment (TL_WDID, Year, Month, Program, 
+                Country, Region).
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_lead_trustandsafety_rolled_up_consolidated` AS
+
+  SELECT 
+    /* =========================================================================================
+       MASTER SKELETON (DIMENSION BACKBONE)
+       Uses incremental COALESCE logic across all joined source tables to preserve 100% of 
+       dimension records (WDID, Month, Year, Hierarchy, Program, Country, Region).
+    ========================================================================================= */
+    COALESCE(a.timestamp, q.timestamp, p.timestamp, sd.timestamp) AS timestamp,
+    COALESCE(a.date, q.date, p.date, sd.date) AS date,
+    COALESCE(a.report_month, q.report_month, p.report_month, sd.report_month) AS report_month,
+    COALESCE(a.report_year, q.report_year, p.report_year, sd.report_year) AS report_year,
+    COALESCE(a.tl_wdid, q.tl_wdid, p.tl_wdid, sd.tl_wdid) AS tl_wdid,
+    COALESCE(a.tl_name, q.tl_name, p.tl_name, sd.tl_name) AS tl_name,
+    COALESCE(a.tl_manager, q.tl_manager, p.tl_manager, sd.tl_manager) AS tl_manager,
+    COALESCE(a.tl_sr_manager, q.tl_sr_manager, p.tl_sr_manager, sd.tl_sr_manager) AS tl_sr_manager,
+    COALESCE(a.program, q.program, p.program, sd.program) AS program,
+    COALESCE(a.country, q.country, p.country, sd.country) AS country,
+    COALESCE(a.region, q.region, p.region, sd.region) AS region,
+
+    /* =========================================================================================
+       COMPONENT 1: ACCEPTED APPEALS BLOCK
+       Direct passthrough of all rolled-up Accepted Appeals metrics, targets, tiers, and points.
+    ========================================================================================= */
+    a.accepted_appeals_business_category,
+    a.accepted_appeals_kpi,
+    a.accepted_appeals_target_master,
+    a.accepted_appeals_weight_master,
+    a.aa_actual,
+    a.aa_score_target_program,
+    a.accepted_appeals_performance_before_goal,
+    a.accepted_appeals_ptg,
+    a.acceptes_appeals_achievement_tier,
+    a.accepted_appeals_points_obtained,
+    a.accepted_appeals_weight_obtained,
+    a.accepted_appeals_points_final_score,
+    a.aa_notes,
+    a.aa_kpi_applicable,
+    a.aa_exempt,
+    a.aa_reason,
+
+    /* =========================================================================================
+       COMPONENT 2: QUALITY PERCENT TO GOAL BLOCK
+       Direct passthrough of all rolled-up Quality metrics, targets, tiers, and points.
+    ========================================================================================= */
+    q.qaptg_business_category,
+    q.qa_kpi,
+    q.quality_score_actual,
+    q.quality_score_target_program,
+    q.quality_notes,
+    q.qa_kpi_applicable,
+    q.qa_exempt,
+    q.qa_reason,
+    q.quality_weight_master,
+    q.quality_ptg,
+    q.quality_achievement_tier,
+    q.quality_points_obtained,
+    q.quality_weight_obtained,
+    q.quality_points_final_score,
+
+    /* =========================================================================================
+       COMPONENT 3: SERVICE DELIVERY BLOCK
+       Direct passthrough of all rolled-up Service Delivery metrics, evaluation counts, tiers, and points.
+    ========================================================================================= */
+    sd.sd_business_category,
+    sd.sd_kpi,
+    sd.sd_weight_master,
+    sd.sd_target_master,
+    sd.sd_qa_evals_completed,
+    sd.sd_qa_evals_target,
+    sd.sd_avg_evals_completed,
+    sd.sd_aa_score_target_program,
+    sd.sd_avg_accepted_appeals,
+    sd.sd_ptg,
+    sd.sd_achievement_tier,
+    sd.sd_metric_points,
+    sd.sd_weight_obtained,
+    sd.sd_points_final_score,
+    sd.sd_notes,
+    sd.sd_kpi_applicable,
+    sd.sd_exempt,
+
+    /* =========================================================================================
+       COMPONENT 4: PRODUCTIVITY BLOCK
+       Direct passthrough of updated Productivity metrics, calibration counts, tiers, and points.
+    ========================================================================================= */
+    p.productivity_business_category,
+    p.productivity_kpi,
+    p.qa_count,
+    p.ts_calibrations_completed,
+    p.ts_calibrations_required,
+    p.ts_evals_completed,
+    p.ts_evals_target,
+    p.calibrations_ptg,
+    p.evaluations_ptg,
+    p.productivity_weight_master,
+    p.productivity_target_master,
+    p.productivity_ptg,
+    p.qa_cal_na,
+    p.qa_evals_na,
+    p.qa_cal_exempt,
+    p.qa_evals_exempt,
+    p.ts_exemption_reason,
+    p.notes,
+    p.productivity_achievement_tier,
+    p.productivity_points_obtained,
+    p.productivity_weight_earned,
+    p.productivity_points_final_score
+
+  /* =========================================================================================
+     FULL OUTER JOIN CHAIN WITH INCREMENTAL COALESCE
+     Chains all four detailed metric ETL tables together. Incremental COALESCE on joining keys 
+     guarantees complete row retention and alignment across multi-program geographical operations.
+  ========================================================================================= */
+  FROM `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_acceptedappeals_ETL` a
+  
+  FULL OUTER JOIN `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_qualitypercenttogoal_ETL` q
+    ON a.tl_wdid = q.tl_wdid 
+   AND a.report_year = q.report_year 
+   AND a.report_month = q.report_month 
+   AND a.program = q.program
+   -- Geographical alignment
+   AND a.country = q.country
+   AND a.region = q.region
+   
+  FULL OUTER JOIN `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_productivity_ETL` p
+    ON COALESCE(a.tl_wdid, q.tl_wdid) = p.tl_wdid 
+   AND COALESCE(a.report_year, q.report_year) = p.report_year 
+   AND COALESCE(a.report_month, q.report_month) = p.report_month 
+   AND COALESCE(a.program, q.program) = p.program
+   -- Geographical alignment with incremental COALESCE
+   AND COALESCE(a.country, q.country) = p.country
+   AND COALESCE(a.region, q.region) = p.region
+
+  FULL OUTER JOIN `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_servicedelivery_ETL` sd
+    ON COALESCE(a.tl_wdid, q.tl_wdid, p.tl_wdid) = sd.tl_wdid 
+   AND COALESCE(a.report_year, q.report_year, p.report_year) = sd.report_year 
+   AND COALESCE(a.report_month, q.report_month, p.report_month) = sd.report_month 
+   AND COALESCE(a.program, q.program, p.program) = sd.program
+   -- Geographical alignment with incremental COALESCE
+   AND COALESCE(a.country, q.country, p.country) = sd.country
+   AND COALESCE(a.region, q.region, p.region) = sd.region;
+
+END;
