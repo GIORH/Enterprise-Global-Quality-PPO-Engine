@@ -1,0 +1,91 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_manager_trustandsafety_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step1_sp_2026_scorecard_manager_trustandsafety_rolled_up_consolidated
+   DESCRIPTION: Master consolidation procedure for the Trust & Safety CX Quality Manager Scorecard. 
+                Integrates the two core Manager-level operational metric ETL components (Accepted 
+                Appeals % to Goal and Quality % to Goal) using COALESCE logic and a FULL OUTER JOIN. 
+                This guarantees zero record loss across all operational metrics while maintaining 
+                strict geographical and hierarchical composite key alignment (TL_Manager, Report_Year, 
+                Report_Month, Program, Country, Region) to prevent Cartesian products in multi-country 
+                programs.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_manager_trustandsafety_rolled_up_consolidated` AS
+  
+  SELECT 
+    /* =========================================================================================
+       MASTER SKELETON (DIMENSION BACKBONE)
+       Uses COALESCE logic across joined source tables to preserve 100% of dimension records 
+       (Timestamps, Dates, Reporting Period, Manager Hierarchy, Program, Country, Region).
+    ========================================================================================= */
+    COALESCE(a.timestamp, q.timestamp) AS timestamp,
+    COALESCE(a.date, q.date) AS date,
+    COALESCE(a.report_month, q.report_month) AS report_month,
+    COALESCE(a.report_year, q.report_year) AS report_year,
+    COALESCE(a.tl_manager, q.tl_manager) AS tl_manager,
+    COALESCE(a.tl_sr_manager, q.tl_sr_manager) AS tl_sr_manager,
+    COALESCE(a.program, q.program) AS program,
+    COALESCE(a.country, q.country) AS country,
+    COALESCE(a.region, q.region) AS region,
+
+    /* =========================================================================================
+       COMPONENT 1: ACCEPTED APPEALS BLOCK
+       Direct passthrough of all rolled-up Manager Accepted Appeals metrics, actuals, targets, 
+       tiers, and final points.
+    ========================================================================================= */
+    a.accepted_appeals_business_category,
+    a.accepted_appeals_kpi,
+    a.aa_actual,
+    a.aa_score_target_program,
+    a.accepted_appeals_weight_master,
+    a.accepted_appeals_target,
+    a.accepted_appeals_performance_before_goal,
+    a.accepted_appeals_ptg,
+    a.accepted_appeals_achievement_tier,
+    a.accepted_appeals_points_obtained,
+    a.accepted_appeals_weight_obtained,
+    a.accepted_appeals_points_final_score,
+    a.aa_notes,
+    a.aa_kpi_applicable,
+    a.aa_exempt,
+    a.aa_reason,
+
+    /* =========================================================================================
+       COMPONENT 2: QUALITY PERCENT TO GOAL BLOCK
+       Direct passthrough of all rolled-up Manager Quality metrics, actuals, targets, 
+       tiers, and final points.
+    ========================================================================================= */
+    q.qaptg_business_category,
+    q.qa_kpi,
+    q.quality_score_actual,
+    q.quality_score_target_program,
+    q.quality_weight_master,
+    q.quality_ptg,
+    q.quality_achievement_tier,
+    q.quality_points_obtained,
+    q.quality_weight_obtained,
+    q.quality_points_final_score,
+    q.quality_notes,
+    q.qa_kpi_applicable,
+    q.qa_exempt,
+    q.qa_reason
+
+  /* =========================================================================================
+     FULL OUTER JOIN WITH COMPOSITE BUSINESS KEYS
+     Joins Accepted Appeals and Quality % to Goal Step 0 ETL datasets. Strict composite key 
+     matching on Manager, Period, Program, and Geography prevents duplicate or orphan rows.
+  ========================================================================================= */
+  FROM `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_manager_trustandsafety_acceptedappeals_ETL` a
+  
+  FULL OUTER JOIN `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_manager_trustandsafety_qualitypercenttogoal_ETL` q
+    ON a.tl_manager = q.tl_manager
+   AND a.report_year = q.report_year
+   AND a.report_month = q.report_month
+   AND a.program = q.program
+   -- Geographical alignment to eliminate Cartesian products in multi-country programs
+   AND a.country = q.country
+   AND a.region = q.region;
+
+END;
