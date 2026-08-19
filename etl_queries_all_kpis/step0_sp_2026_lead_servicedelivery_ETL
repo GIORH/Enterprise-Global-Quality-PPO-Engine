@@ -1,0 +1,143 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_servicedelivery_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_lead_servicedelivery_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Service Delivery' KPI from the Analyst 
+                level up to the CX Quality Team Lead hierarchy. It evaluates rolled-up team 
+                performance for QA and VOC evaluation targets, determines the active operational 
+                footprint for multi-program weight dilution, and maps the aggregated scores 
+                to a standard 4-tier achievement scale for scorecard integration.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_service_delivery_team_lead_detailed` AS
+  
+  /* =========================================================================================
+     CTE 1: HIERARCHICAL FOOTPRINT TRACKING
+     Determines the exact number of applicable, non-exempt operational footprint combinations 
+     (Program + Country + Region) managed by each Team Lead. This distinct count is critical 
+     for accurate multi-program weight dilution calculations downstream.
+  ========================================================================================= */
+  WITH ProgramCounts AS (
+    SELECT 
+      CAST(tl_wdid AS STRING) as tl_wdid, 
+      CAST(report_month AS STRING) as report_month, 
+      CAST(report_year AS STRING) as report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(TRIM(kpi_applicable)) = 'YES' AND UPPER(TRIM(exempt)) = 'NO' THEN CONCAT(program, COALESCE(country, ''), COALESCE(region, '')) END) AS final_total_programs
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_productivity_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  /* =========================================================================================
+     CTE 2: ANALYST-TO-LEAD METRIC AGGREGATION
+     Rolls up the granular analyst-level service delivery metrics into a unified Team Lead view. 
+     Consolidates applicability flags and aggregates raw metrics (QA and VOC evaluations) 
+     exclusively for active, non-exempt analysts to protect the integrity of the hierarchical 
+     average score. Uses safe casting to ensure numeric stability during the rollup.
+  ========================================================================================= */
+  AggregatedData AS (
+    SELECT 
+      'CX Quality Team Lead and Sr Team lead' AS role,
+      MAX(timestamp) AS timestamp,
+      MAX(submitter_email) AS submitter_email,
+      CAST(report_month AS STRING) as report_month,
+      CAST(report_year AS STRING) as report_year,
+      CAST(tl_wdid AS STRING) as tl_wdid,
+      tl_name,
+      ANY_VALUE(tl_manager) AS tl_manager,
+      ANY_VALUE(tl_sr_manager) AS tl_sr_manager,
+      program,
+      country,
+      region,
+      'My Business' as service_delivery_business_category,
+      'Service Delivery' as kpi,
+      
+      -- Consolidates analyst-level flags to determine Team Lead metric applicability
+      IF(COUNTIF(LOWER(TRIM(kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS service_delivery_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(exempt)) = 'no') > 0, 'No', 'Yes') AS service_delivery_exempt,
+      MAX(CASE WHEN LOWER(TRIM(exempt)) = 'yes' THEN reason ELSE NULL END) AS service_delivery_reason,
+      
+      -- Quantitative aggregations safely excluding exempt analysts
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(qa_evals_completed AS FLOAT64) ELSE NULL END) as qa_evals_completed,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(qa_evals_target AS FLOAT64) ELSE NULL END) as qa_evals_target,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(voc_evals_completed AS FLOAT64) ELSE NULL END) as voc_evals_completed,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(voc_evals_target AS FLOAT64) ELSE NULL END) as voc_evals_target,
+
+      -- Computes the team average for individual evaluation pillars
+      AVG(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(REPLACE(qa_evals_completion, '%', '') AS FLOAT64) ELSE NULL END) / 100 as _qa_comp_avg,
+      AVG(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(REPLACE(voc_evals_completion, '%', '') AS FLOAT64) ELSE NULL END) / 100 as _voc_comp_avg,
+
+      -- Computes the overall unified team average score
+      AVG(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(REPLACE(service_delivery_pct_to_goal, '%', '') AS FLOAT64) ELSE NULL END) / 100 as _sd_score_avg
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_service_delivery_analyst_detailed`
+    GROUP BY 4,5,6,7,10,11,12
+  ),
+
+  /* =========================================================================================
+     CTE 3: METRIC BENCHMARKING & POINT ALLOCATION
+     Merges the aggregated metrics with the operational footprint counts. Injects standard 
+     scorecard metadata (1.00 target, 10% weight) and evaluates the hierarchical average score 
+     against continuous performance thresholds to assign the base metric points (1-4).
+  ========================================================================================= */
+  CalculatedLevels AS (
+    SELECT 
+      ad.*,
+      pc.final_total_programs,
+      IF(ad.service_delivery_kpi_applicable = 'No' OR ad.service_delivery_exempt = 'Yes', NULL, 1.00) as service_delivery_target_master,
+      IF(ad.service_delivery_exempt = 'Yes', NULL, 0.10) as service_delivery_weight_master,
+      
+      IF(ad.service_delivery_exempt = 'Yes', NULL, FORMAT("%.2f%%", ad._qa_comp_avg * 100)) as qa_evals_completion,
+      IF(ad.service_delivery_exempt = 'Yes', NULL, FORMAT("%.2f%%", ad._voc_comp_avg * 100)) as voc_evals_completion,
+      IF(ad.service_delivery_exempt = 'Yes', NULL, FORMAT("%.2f%%", ad._sd_score_avg * 100)) as service_delivery_pct_to_goal,
+
+      IF(ad.service_delivery_exempt = 'Yes', NULL, 
+        CASE 
+          WHEN ad._sd_score_avg < 0.90 THEN 1
+          WHEN ad._sd_score_avg < 1.00 THEN 2
+          WHEN ad._sd_score_avg < 1.01 THEN 3
+          ELSE 4
+        END) as service_delivery_points_obtained
+    FROM AggregatedData ad
+    LEFT JOIN ProgramCounts pc 
+      ON ad.tl_wdid = pc.tl_wdid 
+      AND ad.report_month = pc.report_month 
+      AND ad.report_year = pc.report_year
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: SCORECARD MAPPING & DILUTION
+     Finalizes the scorecard presentation layer. Maps the earned points to standardized 
+     Achievement Categories. Computes the final numerical points, formatted earned weight 
+     percentages, and the program-diluted weight distribution essential for multi-program scorecards.
+  ========================================================================================= */
+  SELECT 
+    * EXCEPT(_qa_comp_avg, _voc_comp_avg, _sd_score_avg),
+    
+    CASE 
+      WHEN service_delivery_exempt = 'Yes' THEN NULL
+      WHEN service_delivery_points_obtained = 1 THEN 'Improvement Required'
+      WHEN service_delivery_points_obtained = 2 THEN 'Developing'
+      WHEN service_delivery_points_obtained = 3 THEN 'Achieving'
+      ELSE 'Excelling'
+    END as service_delivery_status,
+
+    -- Numerical points derived for final global score aggregation
+    IF(service_delivery_exempt = 'Yes', NULL, SAFE_CAST(service_delivery_points_obtained * 0.10 AS FLOAT64)) as service_delivery_points_obtained_for_final_score_only,
+
+    -- Quartered mathematical weight evaluation formatted for presentation
+    IF(service_delivery_exempt = 'Yes', NULL, FORMAT("%.2f%%", (0.10 * (CASE 
+                                 WHEN service_delivery_points_obtained = 1 THEN 0.25 
+                                 WHEN service_delivery_points_obtained = 2 THEN 0.50 
+                                 WHEN service_delivery_points_obtained = 3 THEN 0.75 
+                                 ELSE 1.00 END)) * 100)) as service_delivery_earned_weight,
+
+    -- Dilutes the earned weight proportionally across the active managed footprint
+    IF(service_delivery_exempt = 'Yes', NULL, (0.10 * (CASE 
+                               WHEN service_delivery_points_obtained = 1 THEN 0.25 
+                               WHEN service_delivery_points_obtained = 2 THEN 0.50 
+                               WHEN service_delivery_points_obtained = 3 THEN 0.75 
+                               ELSE 1.00 END)) * SAFE_DIVIDE(1.0, NULLIF(final_total_programs, 0))) as service_delivery_weight_obtaiend_program_diluted
+
+  FROM CalculatedLevels;
+
+END;
