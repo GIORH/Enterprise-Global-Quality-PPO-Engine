@@ -1,0 +1,243 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_analyst_non_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step1_sp_2026_scorecard_analyst_non_rolled_up_consolidated
+   DESCRIPTION: Master consolidation procedure for individual Analyst non-rolled-up metrics 
+                (Professional Personal Development - PPD and Team Development - TD). 
+                Aggregates monthly numerators and denominators while calculating YTD windowed 
+                accumulations. Evaluates Percentage to Goal (PTG), performance tiers, and metric 
+                points strictly on non-cumulative monthly values, ensuring a single unified record 
+                per analyst per month.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_analyst_non_rolled_up_consolidate` AS
+  
+  /* =========================================================================================
+     BLOCK 1: DIMENSION COLLECTION (SKELETON)
+     Unions dimension records across PPD and Team Development datasets. Constructs the composite 
+     relational lookup key (TM_WDID|Month|Year) and deduplicates hierarchy fields per analyst.
+  ========================================================================================= */
+  WITH Raw_Dimensions AS (
+      SELECT tm_wdid, report_month, report_year, timestamp, submitter_email, tl_wdid, tl_name, tl_manager, tl_sr_manager, tm_name, country, region
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_team_dev_raw`
+      UNION ALL
+      SELECT tm_wdid, report_month, report_year, timestamp, submitter_email, tl_wdid, tl_name, tl_manager, tl_sr_manager, tm_name, country, region
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_ppd_raw`
+  ),
+
+  Final_Skeleton AS (
+    SELECT 
+      CONCAT(SAFE_CAST(tm_wdid AS STRING), '|', SAFE_CAST(report_month AS STRING), '|', SAFE_CAST(report_year AS STRING)) as key,
+      'CX Quality Analyst' as role,
+      MAX(COALESCE(
+        SAFE.FORMAT_TIMESTAMP('%m/%d/%Y', SAFE_CAST(timestamp AS TIMESTAMP)),
+        SAFE.FORMAT_DATE('%m/%d/%Y', SAFE.PARSE_DATE('%m/%d/%Y', REGEXP_EXTRACT(timestamp, r'\d{1,2}/\d{1,2}/\d{4}'))),
+        CAST(timestamp AS STRING)
+      )) as timestamp,
+      MAX(submitter_email) as submitter_email,
+      SAFE_CAST(report_month AS STRING) as report_month,
+      SAFE_CAST(report_year AS STRING) as report_year,
+      MAX(tl_wdid) as tl_wdid, MAX(tl_name) as tl_name, MAX(tl_manager) as tl_manager, MAX(tl_sr_manager) as tl_sr_manager,
+      SAFE_CAST(tm_wdid AS STRING) as tm_wdid, MAX(tm_name) as tm_name, MAX(country) as country, MAX(region) as region
+    FROM Raw_Dimensions
+    GROUP BY tm_wdid, report_month, report_year
+  ),
+
+  /* =========================================================================================
+     BLOCK 2: PPD CALCULATION (MONTHLY + YTD CUMULATIVE)
+     Aggregates monthly course completion volumes and computes windowed year-to-date running 
+     totals. Evaluates monthly Percentage to Goal against the 1.00 target and assigns 
+     Achievement Categories and metric points based on a 15% metric weight.
+  ========================================================================================= */
+  PPD_Monthly_Base AS (
+    SELECT 
+      tm_wdid, 
+      report_month, 
+      report_year,
+      SUM(SAFE_CAST(courses_completed AS FLOAT64)) as current_month_completed,
+      SUM(SAFE_CAST(courses_required AS FLOAT64)) as current_month_required,
+      MAX(kpi_applicable) as max_kpi_applicable,
+      MAX(exempt) as max_exempt,
+      MAX(reason) as max_reason,
+      SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(CAST(report_month AS STRING), 1, 3)), ' ', CAST(report_year AS STRING))) AS parsed_date
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_ppd_raw`
+    GROUP BY tm_wdid, report_month, report_year
+  ),
+
+  PPD_Rolled_Up AS (
+    SELECT 
+      CONCAT(SAFE_CAST(tm_wdid AS STRING), '|', SAFE_CAST(report_month AS STRING), '|', SAFE_CAST(report_year AS STRING)) as key,
+      'My Team' as ppd_business_category,
+      'PPD' as ppd_kpi,
+      
+      -- Monthly non-cumulative values
+      current_month_completed as ppd_courses_completed,
+      -- YTD cumulative values
+      SUM(current_month_completed) OVER (PARTITION BY tm_wdid, report_year ORDER BY parsed_date) as ppd_courses_completed_ytd,
+      
+      -- Monthly non-cumulative values
+      current_month_required as ppd_courses_required,
+      -- YTD cumulative values
+      SUM(current_month_required) OVER (PARTITION BY tm_wdid, report_year ORDER BY parsed_date) as ppd_courses_required_ytd,
+      
+      max_kpi_applicable as ppd_kpi_applicable,
+      max_exempt as ppd_exempt,
+      max_reason as ppd_reason,
+      
+      IF(UPPER(TRIM(max_kpi_applicable)) = 'NO' OR UPPER(TRIM(max_exempt)) = 'YES', NULL, 0.15) as ppd_weight,
+      IF(UPPER(TRIM(max_kpi_applicable)) = 'NO' OR UPPER(TRIM(max_exempt)) = 'YES', NULL, 1.00) as ppd_target
+    FROM PPD_Monthly_Base
+  ),
+
+  PPD_Calculated AS (
+    SELECT 
+      *,
+      -- Evaluates PTG strictly on discrete monthly performance
+      IF(ppd_target IS NULL, NULL, SAFE_DIVIDE(ppd_courses_completed, ppd_courses_required)) as ppd_ptg
+    FROM PPD_Rolled_Up
+  ),
+
+  PPD_Final AS (
+    SELECT 
+      *,
+      -- Monthly PPD performance tier classification
+      CASE 
+        WHEN ppd_ptg IS NULL THEN NULL
+        WHEN ppd_ptg < 0.50 THEN 'Improvement Required'
+        WHEN ppd_ptg < 1.00 THEN 'Developing'
+        WHEN ppd_ptg <= 1.00 THEN 'Achieving'
+        ELSE 'Excelling'
+      END as ppd_achievement_category,
+      -- Monthly PPD metric point allocation
+      CASE 
+        WHEN ppd_ptg IS NULL THEN NULL
+        WHEN ppd_ptg < 0.50 THEN 1
+        WHEN ppd_ptg < 1.00 THEN 2
+        WHEN ppd_ptg <= 1.00 THEN 3
+        ELSE 4
+      END as ppd_points_obtained
+    FROM PPD_Calculated
+  ),
+
+  /* =========================================================================================
+     BLOCK 3: TEAM DEVELOPMENT CALCULATION (MONTHLY + YTD CUMULATIVE)
+     Aggregates monthly workshops delivered and computes windowed year-to-date running totals. 
+     Evaluates monthly Percentage to Goal against the 1.00 target and assigns Achievement 
+     Categories and metric points based on a 15% metric weight.
+  ========================================================================================= */
+  TD_Monthly_Base AS (
+    SELECT 
+      tm_wdid, 
+      report_month, 
+      report_year,
+      SUM(SAFE_CAST(workshops_delivered AS FLOAT64)) as current_month_delivered,
+      MAX(SAFE_CAST(workshops_required AS FLOAT64)) as current_month_required,
+      MAX(kpi_applicable) as max_kpi_applicable,
+      MAX(exempt) as max_exempt,
+      MAX(reason) as max_reason,
+      SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(CAST(report_month AS STRING), 1, 3)), ' ', CAST(report_year AS STRING))) AS parsed_date
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_team_dev_raw`
+    GROUP BY tm_wdid, report_month, report_year
+  ),
+
+  TD_Rolled_Up AS (
+    SELECT 
+      CONCAT(SAFE_CAST(tm_wdid AS STRING), '|', SAFE_CAST(report_month AS STRING), '|', SAFE_CAST(report_year AS STRING)) as key,
+      'My Team' as td_business_category,
+      'Team Development' as td_kpi,
+      
+      -- Monthly non-cumulative values
+      current_month_delivered as td_workshops_delivered,
+      -- YTD cumulative values
+      SUM(current_month_delivered) OVER (PARTITION BY tm_wdid, report_year ORDER BY parsed_date) as td_workshops_delivered_ytd,
+      
+      -- Monthly non-cumulative values
+      current_month_required as td_workshops_required,
+      -- YTD cumulative values
+      SUM(current_month_required) OVER (PARTITION BY tm_wdid, report_year ORDER BY parsed_date) as td_workshops_required_ytd,
+      
+      max_kpi_applicable as td_kpi_applicable,
+      max_exempt as td_exempt,
+      max_reason as td_reason,
+      
+      IF(UPPER(TRIM(max_kpi_applicable)) = 'NO' OR UPPER(TRIM(max_exempt)) = 'YES', NULL, 0.15) as td_weight,
+      IF(UPPER(TRIM(max_kpi_applicable)) = 'NO' OR UPPER(TRIM(max_exempt)) = 'YES', NULL, 1.00) as td_target
+    FROM TD_Monthly_Base
+  ),
+
+  TD_Calculated AS (
+    SELECT 
+      *,
+      -- Evaluates PTG strictly on discrete monthly performance
+      IF(td_target IS NULL, NULL, SAFE_DIVIDE(td_workshops_delivered, td_workshops_required)) as td_ptg
+    FROM TD_Rolled_Up
+  ),
+
+  TD_Final AS (
+    SELECT 
+      *,
+      -- Monthly Team Development performance tier classification
+      CASE 
+        WHEN td_ptg IS NULL THEN NULL
+        WHEN td_ptg < 1.00 THEN 'Improvement Required'
+        WHEN td_ptg <= 1.00 THEN 'Achieving'
+        ELSE 'Excelling'
+      END as td_achievement_category,
+      -- Monthly Team Development metric point allocation
+      CASE 
+        WHEN td_ptg IS NULL THEN NULL
+        WHEN td_ptg < 1.00 THEN 1
+        WHEN td_ptg <= 1.00 THEN 3
+        ELSE 4
+      END as td_points_obtained
+    FROM TD_Calculated
+  )
+
+  /* =========================================================================================
+     BLOCK 4: FINAL ASSEMBLY AND WEIGHT RECALCULATION
+     Joins the PPD and Team Development calculated layers back to the main dimension skeleton. 
+     Computes earned weights and final scorecard point contributions for both metrics.
+  ========================================================================================= */
+  SELECT 
+    s.*,
+    -- PPD Outputs
+    p.ppd_business_category, 
+    p.ppd_kpi, 
+    p.ppd_courses_completed, 
+    p.ppd_courses_completed_ytd,
+    p.ppd_courses_required, 
+    p.ppd_courses_required_ytd,
+    p.ppd_kpi_applicable, 
+    p.ppd_exempt, 
+    p.ppd_reason,
+    p.ppd_weight, 
+    p.ppd_target, 
+    p.ppd_ptg, 
+    p.ppd_achievement_category, 
+    p.ppd_points_obtained,
+    IF(p.ppd_points_obtained IS NOT NULL, (p.ppd_weight * (p.ppd_points_obtained / 4.0)), NULL) as ppd_weight_obtaiend,
+    IF(p.ppd_points_obtained IS NOT NULL, (p.ppd_weight * p.ppd_points_obtained), NULL) as ppd_points_obtained_for_final_score_only,
+    
+    -- TD Outputs
+    t.td_business_category, 
+    t.td_kpi, 
+    t.td_workshops_delivered, 
+    t.td_workshops_delivered_ytd,
+    t.td_workshops_required, 
+    t.td_workshops_required_ytd,
+    t.td_kpi_applicable, 
+    t.td_exempt, 
+    t.td_reason,
+    t.td_weight, 
+    t.td_target, 
+    t.td_ptg, 
+    t.td_achievement_category, 
+    t.td_points_obtained,
+    IF(t.td_points_obtained IS NOT NULL, (t.td_weight * (t.td_points_obtained / 4.0)), NULL) as td_weight_obtaiend,
+    IF(t.td_points_obtained IS NOT NULL, (t.td_weight * t.td_points_obtained), NULL) as td_points_obtained_for_final_score_only
+  FROM Final_Skeleton s
+  LEFT JOIN PPD_Final p ON s.key = p.key
+  LEFT JOIN TD_Final t ON s.key = t.key;
+
+END;
