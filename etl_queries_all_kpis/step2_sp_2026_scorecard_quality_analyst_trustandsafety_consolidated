@@ -1,0 +1,140 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_quality_analyst_trustandsafety_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step2_sp_2026_scorecard_quality_analyst_trustandsafety_consolidated
+   DESCRIPTION: Master consolidation procedure for the Trust & Safety CX Quality Analyst Scorecard. 
+                Unifies rolled-up operational performance metrics (Accepted Appeals, Quality % to Goal, 
+                Productivity) with non-rolled-up development metrics (Team Development, PPD). 
+                Standardizes composite primary keys (TM_WDID_Month_Year_Program_Country) and 
+                computes the overall scorecard performance ratio against dynamic maximum available 
+                point ceilings (Productivity evaluated on a 3-point scale; all other metrics on a 
+                4-point scale).
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step2_sp_2026_scorecard_quality_analyst_trustandsafety_consolidated` AS
+
+  /* =========================================================================================
+     SOURCE NORMALIZATION & ROOT PROTECTION
+     Parses Analyst Workday IDs from raw text fields, stripping trailing '.0' floating-point artifacts. 
+     Converts reporting months into standard 3-letter upper-case keys (e.g., 'JUN') and filters 
+     out null or placeholder Workday IDs to ensure source-level data integrity.
+  ========================================================================================= */
+  WITH rolled_up AS (
+    SELECT *,
+      REGEXP_REPLACE(TRIM(CAST(tm_wdid AS STRING)), r'\.0$', '') AS tm_wdid_str,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month_str,
+      REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', '') AS year_str
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_analyst_trustandsafety_rolled_up_consolidated`
+    WHERE tm_wdid IS NOT NULL AND TRIM(CAST(tm_wdid AS STRING)) NOT IN ('', '-', 'NULL')
+  ),
+
+  non_rolled_up AS (
+    SELECT *,
+      REGEXP_REPLACE(TRIM(CAST(tm_wdid AS STRING)), r'\.0$', '') AS tm_wdid_str,
+      UPPER(TRIM(SUBSTR(CAST(report_month AS STRING), 1, 3))) AS month_str,
+      REGEXP_REPLACE(TRIM(CAST(report_year AS STRING)), r'\.0$', '') AS year_str
+    FROM `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_analyst_trustandsafety_non_rolled_up_consolidated`
+    WHERE tm_wdid IS NOT NULL AND TRIM(CAST(tm_wdid AS STRING)) NOT IN ('', '-', 'NULL')
+  ),
+
+  /* =========================================================================================
+     CTE 1: BASE CONSOLIDATION & PRIMARY KEY CONSTRUCTION
+     FULL OUTER JOINs rolled-up operational data with non-rolled-up development data. 
+     Constructs the standard composite primary key (WDID_Month_Year_Program_Country) and 
+     preserves Year-to-Date (YTD) cumulative metrics for Team Development and PPD.
+  ========================================================================================= */
+  Base_Scorecard AS (
+    SELECT 
+      'T&S Quality Analyst' AS role,
+      
+      -- Standard Composite Primary Key
+      CONCAT(
+        COALESCE(r.tm_wdid_str, nr.tm_wdid_str), '_', 
+        COALESCE(r.month_str, nr.month_str), '_', 
+        COALESCE(r.year_str, nr.year_str),
+        IFNULL(CONCAT('_', r.program), ''),
+        IFNULL(CONCAT('_', COALESCE(r.country, nr.country)), '')
+      ) AS primary_key,
+
+      COALESCE(CAST(r.timestamp AS STRING), CAST(nr.timestamp AS STRING)) AS timestamp,
+      COALESCE(r.date, SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(nr.report_month), ' ', CAST(nr.report_year AS STRING)))) AS date,
+      COALESCE(r.month_str, nr.month_str) AS report_month,
+      SAFE_CAST(COALESCE(r.year_str, nr.year_str) AS INT64) AS report_year,
+      SAFE_CAST(COALESCE(r.tm_wdid_str, nr.tm_wdid_str) AS INT64) AS tm_wdid,
+      COALESCE(CAST(r.tm_name AS STRING), CAST(nr.tm_name AS STRING)) AS tm_name,
+      COALESCE(CAST(r.tl_wdid AS INT64), CAST(nr.tl_wdid AS INT64)) AS tl_wdid,
+      COALESCE(CAST(r.tl_name AS STRING), CAST(nr.tl_name AS STRING)) AS tl_name,
+      COALESCE(CAST(r.tl_manager AS STRING), CAST(nr.tl_manager AS STRING)) AS tl_manager,
+      COALESCE(CAST(r.tl_sr_manager AS STRING), CAST(nr.tl_sr_manager AS STRING)) AS tl_sr_manager,
+      COALESCE(CAST(r.country AS STRING), CAST(nr.country AS STRING)) AS country,
+      COALESCE(CAST(r.region AS STRING), CAST(nr.region AS STRING)) AS region,
+      r.program,
+      nr.submitter_email,
+
+      -- Operational Metric Blocks (Rolled-up)
+      r.accepted_appeals_business_category, r.accepted_appeals_kpi, r.accepted_appeals_target_master, r.accepted_appeals_weight_master, r.aa_actual, r.aa_score_target_program, r.accepted_appeals_performance_before_goal, r.accepted_appeals_ptg, r.accepted_appeals_achievement_tier, r.accepted_appeals_points_obtained, r.accepted_appeals_weight_obtained, r.accepted_appeals_points_final_score,
+      r.qaptg_business_category, r.qa_kpi, r.quality_score_actual, r.quality_score_target_program, r.quality_weight_master, r.quality_ptg, r.quality_achievement_tier, r.quality_points_obtained, r.quality_weight_obtained, r.quality_points_final_score,
+      r.productivity_business_category, r.productivity_kpi, r.qa_evals_completed, r.qa_evals_target, r.appeals_handled, r.appeals_handled_target, r.rca_handled, r.rca_target, r.productivity_weight_master, r.productivity_target_master, r.productivity_ptg, r.productivity_achievement_tier, r.productivity_points_obtained, r.productivity_weight_earned, r.productivity_points_final_score,
+      
+      -- Team Development Outputs (Non-rolled-up; Includes _ytd tracking)
+      nr.teamdevelopment_business_category, nr.teamdevelopment_kpi, nr.workshops_delivered, nr.workshops_delivered_ytd, nr.workshops_required, nr.workshops_required_ytd, nr.td_notes, nr.td_kpi_applicable, nr.td_exempt, nr.td_reason, nr.teamdevelopment_target_master, nr.teamdevelopment_weight_master, nr.teamdevelopment_ptg, nr.team_development_achievement_category, nr.team_developoment_points, nr.team_development_weight_obtained, nr.team_development_points_final_score,
+      
+      -- PPD Outputs (Non-rolled-up; Includes _ytd tracking)
+      nr.ppd_business_category, nr.ppd_kpi, nr.courses_completed, nr.courses_completed_ytd, nr.courses_required, nr.courses_required_ytd, nr.ppd_notes, nr.ppd_kpi_applicable, nr.ppd_exempt, nr.ppd_reason, nr.ppd_target_master, nr.ppd_weight_master, nr.ppd_ptg, nr.ppd_achievement_category, nr.ppd_points, nr.ppd_weight_earn, nr.ppd_final_points
+    FROM rolled_up r
+    FULL OUTER JOIN non_rolled_up nr
+      ON r.tm_wdid_str = nr.tm_wdid_str
+     AND r.month_str = nr.month_str
+     AND r.year_str = nr.year_str
+  ),
+
+  /* =========================================================================================
+     CTE 2: DYNAMICS SCORE & POINT CEILING SUMMATION
+     Dynamically calculates the maximum available point ceiling (Productivity evaluated 
+     on a 3-point scale multiplier; all other metrics on a 4-point scale multiplier) 
+     and sums total earned final points across all active operational and development blocks.
+  ========================================================================================= */
+  DAPT_Calculations AS (
+    SELECT
+      *,
+      -- Standardized metadata pillars for Step 3 Unpivot
+      CAST('All' AS STRING) AS final_score_business_category,
+      CAST('Final Score' AS STRING) AS final_score_kpi,
+
+      -- Maximum available points ceiling calculation
+      (COALESCE(accepted_appeals_weight_master, 0) * 4 + 
+       COALESCE(quality_weight_master, 0) * 4 + 
+       COALESCE(productivity_weight_master, 0) * 3 + 
+       COALESCE(teamdevelopment_weight_master, 0) * 4 + 
+       COALESCE(ppd_weight_master, 0) * 4) AS max_final_score_points_available,
+
+      -- Total obtained points summation
+      (COALESCE(accepted_appeals_points_final_score, 0) + 
+       COALESCE(quality_points_final_score, 0) + 
+       COALESCE(productivity_points_final_score, 0) + 
+       COALESCE(team_development_points_final_score, 0) + 
+       COALESCE(ppd_final_points, 0)) AS final_score_points_obtained
+    FROM Base_Scorecard
+  )
+
+  /* =========================================================================================
+     FINAL MASTER SELECTION
+     Calculates the overall final performance ratio (obtained points / max available points) 
+     and maps the overall percentage to executive T&S Quality Analyst achievement tiers.
+  ========================================================================================= */
+  SELECT
+    *,
+    -- Final overall score ratio calculation
+    SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) AS final_score_ptg,
+    
+    -- Final Tier mapping based on overall scorecard performance ranges
+    CASE 
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.87 THEN 'Excelling'
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.75 THEN 'Achieving'
+      WHEN SAFE_DIVIDE(final_score_points_obtained, max_final_score_points_available) >= 0.50 THEN 'Developing'
+      ELSE 'Improvement Required'
+    END AS final_score_tier
+  FROM DAPT_Calculations;
+
+END;
