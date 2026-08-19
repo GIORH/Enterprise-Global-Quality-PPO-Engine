@@ -1,0 +1,165 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step5_sp_2026_quality_department_scorecard_master_pr`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step5_sp_2026_quality_department_scorecard_master_pr
+   DESCRIPTION: Unified master consolidation procedure for the Payroll (PR) layer of the 2026 
+                Quality Department Scorecard[cite: 28]. Consolidates collapsed, deduplicated PR 
+                unpivoted datasets across all 8 operational and executive roles (CX and Trust & Safety 
+                Analysts, Team Leads, Managers, Regional Leads, and Directors)[cite: 28]. 
+                Preserves standardized 23-column analytical layout, FLOAT64 metric casting, 
+                progressive Year-to-Date (YTD) tracking (`ytd_final_scores`, `ytd_final_tier`), 
+                dynamic Looker Studio optimization flags (`is_latest_month`), and 3-Level Row Level 
+                Security (RLS) security definitions[cite: 28].
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.quality_department_scorecard_master_pr` AS
+
+  WITH consolidated_data AS (
+
+    /* =========================================================================================
+       1. CX QUALITY ANALYST (PAYROLL UNPIVOTED STREAM)
+    ========================================================================================= */
+    SELECT 
+      performance_date, CAST(report_year AS STRING) AS report_year, report_month, position_role, employee_id, quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1, immediate_manager AS inmediate_supervisor_2, immediate_sr_manager AS inmediate_supervisor_3,
+      kpi AS Metric_Name, business_category, weight_master AS metric_weight, target_master AS actual_target, percent_to_target,
+      achievement_tier AS tier, max_points_available, metric_points, metric_weight_obtained AS weight_earned, max_rating_available, rating_obtained AS points_final_score,
+      ytd_final_scores, ytd_final_tier, is_latest_month,
+      first_level_security, second_level_security, third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_analyst_unpivoted_pr`
+
+    UNION ALL
+
+    /* =========================================================================================
+       2. TRUST & SAFETY QUALITY ANALYST (PAYROLL UNPIVOTED STREAM)
+    ========================================================================================= */
+    SELECT 
+      performance_date, CAST(report_year AS STRING) AS report_year, report_month, position_role, employee_id, quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1, immediate_manager AS inmediate_supervisor_2, immediate_sr_manager AS inmediate_supervisor_3,
+      kpi AS Metric_Name, business_category, weight_master AS metric_weight, target_master AS actual_target, percent_to_target,
+      achievement_tier AS tier, max_points_available, metric_points, metric_weight_obtained AS weight_earned, max_rating_available, rating_obtained AS points_final_score,
+      ytd_final_scores, ytd_final_tier, is_latest_month,
+      first_level_security, second_level_security, third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_analyst_trustandsafety_unpivoted_pr`
+
+    UNION ALL
+
+    /* =========================================================================================
+       3. CX QUALITY TEAM LEAD (PAYROLL UNPIVOTED STREAM)
+    ========================================================================================= */
+    SELECT 
+      performance_date, CAST(report_year AS STRING) AS report_year, report_month, position_role, employee_id, quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1, immediate_manager AS inmediate_supervisor_2, immediate_sr_manager AS inmediate_supervisor_3,
+      kpi AS Metric_Name, business_category, weight_master AS metric_weight, target_master AS actual_target, percent_to_target,
+      achievement_tier AS tier, max_points_available, metric_points, metric_weight_obtained AS weight_earned, max_rating_available, rating_obtained AS points_final_score,
+      ytd_final_scores, ytd_final_tier, is_latest_month,
+      first_level_security, second_level_security, third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_team_lead_unpivoted_pr`
+
+    UNION ALL
+
+    /* =========================================================================================
+       4. TRUST & SAFETY QUALITY TEAM LEAD (PAYROLL UNPIVOTED STREAM)
+    ========================================================================================= */
+    SELECT 
+      performance_date, CAST(report_year AS STRING) AS report_year, report_month, position_role, employee_id, quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1, immediate_manager AS inmediate_supervisor_2, immediate_sr_manager AS inmediate_supervisor_3,
+      kpi AS Metric_Name, business_category, weight_master AS metric_weight, target_master AS actual_target, percent_to_target,
+      achievement_tier AS tier, max_points_available, metric_points, metric_weight_obtained AS weight_earned, max_rating_available, rating_obtained AS points_final_score,
+      ytd_final_scores, ytd_final_tier, is_latest_month,
+      first_level_security, second_level_security, third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_quality_team_lead_trustandsafety_unpivoted_pr`
+
+    UNION ALL
+
+    /* =========================================================================================
+       5. CX QUALITY MANAGER (PAYROLL UNPIVOTED STREAM)
+    ========================================================================================= */
+    SELECT 
+      performance_date, CAST(report_year AS STRING) AS report_year, report_month, position_role, employee_id, quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1, immediate_manager AS inmediate_supervisor_2, immediate_sr_manager AS inmediate_supervisor_3,
+      kpi AS Metric_Name, business_category, weight_master AS metric_weight, target_master AS actual_target, percent_to_target,
+      achievement_tier AS tier, max_points_available, metric_points, metric_weight_obtained AS weight_earned, max_rating_available, rating_obtained AS points_final_score,
+      ytd_final_scores, ytd_final_tier, is_latest_month,
+      first_level_security, second_level_security, third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_manager_unpivoted_pr`
+
+    UNION ALL
+
+    /* =========================================================================================
+       6. TRUST & SAFETY QUALITY MANAGER (PAYROLL UNPIVOTED STREAM)
+    ========================================================================================= */
+    SELECT 
+      performance_date, CAST(report_year AS STRING) AS report_year, report_month, position_role, employee_id, quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1, immediate_manager AS inmediate_supervisor_2, immediate_sr_manager AS inmediate_supervisor_3,
+      kpi AS Metric_Name, business_category, weight_master AS metric_weight, target_master AS actual_target, percent_to_target,
+      achievement_tier AS tier, max_points_available, metric_points, metric_weight_obtained AS weight_earned, max_rating_available, rating_obtained AS points_final_score,
+      ytd_final_scores, ytd_final_tier, is_latest_month,
+      first_level_security, second_level_security, third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_manager_trustandsafety_unpivoted_pr`
+
+    UNION ALL
+
+    /* =========================================================================================
+       7. CX AND TRUST & SAFETY QUALITY REGIONAL LEAD (PAYROLL UNPIVOTED STREAM)
+    ========================================================================================= */
+    SELECT 
+      performance_date, CAST(report_year AS STRING) AS report_year, report_month, position_role, employee_id, quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1, immediate_manager AS inmediate_supervisor_2, immediate_sr_manager AS inmediate_supervisor_3,
+      kpi AS Metric_Name, business_category, weight_master AS metric_weight, target_master AS actual_target, percent_to_target,
+      achievement_tier AS tier, max_points_available, metric_points, metric_weight_obtained AS weight_earned, max_rating_available, rating_obtained AS points_final_score,
+      ytd_final_scores, ytd_final_tier, is_latest_month,
+      first_level_security, second_level_security, third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_regional_lead_unpivoted_pr`
+
+    UNION ALL
+
+    /* =========================================================================================
+       8. CX AND TRUST & SAFETY QUALITY DIRECTOR (PAYROLL UNPIVOTED STREAM)
+    ========================================================================================= */
+    SELECT 
+      performance_date, CAST(report_year AS STRING) AS report_year, report_month, position_role, employee_id, quality_team_member,
+      immediate_supervisor AS inmediate_supervisor_1, immediate_manager AS inmediate_supervisor_2, immediate_sr_manager AS inmediate_supervisor_3,
+      kpi AS Metric_Name, business_category, weight_master AS metric_weight, target_master AS actual_target, percent_to_target,
+      achievement_tier AS tier, max_points_available, metric_points, metric_weight_obtained AS weight_earned, max_rating_available, rating_obtained AS points_final_score,
+      ytd_final_scores, ytd_final_tier, is_latest_month,
+      first_level_security, second_level_security, third_level_security
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_director_unpivoted_pr`
+  )
+
+  /* =========================================================================================
+     FINAL MASTER SELECTION
+     Projects the consolidated payroll master layer to power executive dashboard reporting 
+     in Looker Studio[cite: 28]. Maintains exact column layout and traditional alias conventions[cite: 28].
+  ========================================================================================= */
+  SELECT 
+    performance_date,
+    position_role,
+    report_month,
+    report_year,
+    employee_id,
+    quality_team_member,
+    inmediate_supervisor_1,
+    inmediate_supervisor_2,
+    inmediate_supervisor_3,
+    Metric_Name,
+    business_category,
+    actual_target,
+    percent_to_target,
+    metric_weight,
+    metric_points,
+    weight_earned,
+    tier,
+    max_points_available AS max_points_avaialble,
+    max_rating_available,
+    points_final_score,
+    ytd_final_scores,
+    ytd_final_tier,
+    is_latest_month,
+    first_level_security,
+    second_level_security,
+    third_level_security
+  FROM consolidated_data;
+
+END;
