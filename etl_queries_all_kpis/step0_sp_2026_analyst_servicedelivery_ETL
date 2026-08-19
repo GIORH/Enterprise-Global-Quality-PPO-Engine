@@ -1,0 +1,137 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_analyst_servicedelivery_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_analyst_servicedelivery_ETL
+   DESCRIPTION: Master ETL pipeline for the Quality Analyst 'Service Delivery' KPI (10% Weight).
+                This metric evaluates completion ratios against targets strictly for QA and VOC 
+                evaluations (explicitly excluding calibrations). The procedure sanitizes raw inputs, 
+                safely calculates component completion rates, aggregates the final Percentage to Goal, 
+                and maps the results to a standard 4-tier achievement scale to determine scorecard 
+                weights and program-diluted impacts.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_service_delivery_analyst_detailed` AS
+  
+  WITH 
+    /* =========================================================================================
+       CTE 1: DATA SANITIZATION (BASE LAYER)
+       Extracts the raw productivity dataset while omitting calibration metrics. Casts 
+       comma-separated string values into FLOAT64 numerical formats to ensure accurate 
+       mathematical processing for QA and VOC targets and completions.
+    ========================================================================================= */
+    base AS (
+      SELECT 
+        * EXCEPT(calibrations_completed, calibrations_target, calibrations_na),
+        SAFE_CAST(REPLACE(CAST(qa_evals_completed AS STRING), ',', '') AS FLOAT64) as n_qa_comp,
+        SAFE_CAST(REPLACE(CAST(qa_evals_target AS STRING), ',', '') AS FLOAT64) as n_qa_target,
+        SAFE_CAST(REPLACE(CAST(voc_evals_completed AS STRING), ',', '') AS FLOAT64) as n_voc_comp,
+        SAFE_CAST(REPLACE(CAST(voc_evals_target AS STRING), ',', '') AS FLOAT64) as n_voc_target
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_productivity_raw`
+      WHERE tm_wdid IS NOT NULL
+    ),
+
+    /* =========================================================================================
+       CTE 2: APPLICABILITY & INDIVIDUAL COMPLETION LOGIC
+       Identifies which of the two evaluation pillars (QA, VOC) are applicable for the month (v_z).
+       Calculates the completion ratio for each active pillar, defaulting to 0 when targets 
+       are zero to proactively prevent division-by-zero execution errors.
+    ========================================================================================= */
+    logic AS (
+      SELECT 
+        *,
+        -- Safely count the applicable evaluation components
+        (IF(UPPER(TRIM(qa_evals_na)) = 'YES', 1, 0) + 
+         IF(UPPER(TRIM(voc_na)) = 'YES', 1, 0)) AS v_z,
+
+        -- Calculate individual pillar completion ratios
+        IF(n_qa_target = 0, 0, n_qa_comp / n_qa_target) as v_qa_c,
+        IF(n_voc_target = 0, 0, n_voc_comp / n_voc_target) as v_voc_c
+      FROM base
+    ),
+
+    /* =========================================================================================
+       CTE 3: CONSOLIDATED SCORE DERIVATION
+       Computes the unified Service Delivery score by summing the individual pillar ratios 
+       and dividing by the total count of applicable components (v_z). Safely nullifies scores 
+       for analysts flagged as exempt or inapplicable.
+    ========================================================================================= */
+    final_math AS (
+      SELECT 
+        *,
+        -- Average Score calculation with exemption handling
+        CASE 
+          WHEN UPPER(TRIM(kpi_applicable)) <> 'YES' OR UPPER(TRIM(exempt)) = 'YES' OR v_z = 0 THEN NULL 
+          ELSE SAFE_DIVIDE((COALESCE(v_qa_c, 0) + COALESCE(v_voc_c, 0)), v_z) 
+        END AS v_score
+      FROM logic
+    )
+
+  /* =========================================================================================
+     FINAL OUTPUT: SCORECARD MAPPING, FORMATTING & DILUTION
+     Reintegrates the raw dimensions and formatted calculation pillars. Evaluates the aggregated 
+     score against the 4-tier performance scale (Improvement Required, Developing, Achieving, 
+     Excelling). Generates the standard metric points, calculated earned weight, and the 
+     program-diluted weights necessary for proportional multi-program scorecard roll-ups.
+  ========================================================================================= */
+  SELECT 
+    -- 1. Preserve original source dimensions
+    f.* EXCEPT(n_qa_comp, n_qa_target, n_voc_comp, n_voc_target, v_z, v_qa_c, v_voc_c, v_score),
+    
+    -- 2. Inject static metric metadata (Business Category, KPI Name, Master Weight, Master Target)
+    'My Business' as service_delivery_business_category,
+    'Service Delivery' as kpi,
+    IF(UPPER(TRIM(f.kpi_applicable)) = 'NO' OR UPPER(TRIM(f.exempt)) = 'YES', NULL, 1.00) AS service_delivery_target_master, 
+    IF(UPPER(TRIM(f.kpi_applicable)) = 'NO' OR UPPER(TRIM(f.exempt)) = 'YES', NULL, 0.10) AS service_delivery_weight_master,
+    'CX Quality Analyst' as role,
+
+    -- 3. Reintegrate formatted individual pillar ratios
+    FORMAT("%.2f%%", f.v_qa_c * 100) as qa_evals_completion,
+    FORMAT("%.2f%%", f.v_voc_c * 100) as voc_evals_completion,
+
+    -- 4. Count of applicable operational components (Defaults to 0 if exempt)
+    CASE 
+      WHEN UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' THEN 0 
+      ELSE f.v_z 
+    END as service_delivery_applicable_components_count,
+
+    -- 5. Final Score Percentage and Achievement Categorization
+    IF(f.v_score IS NULL, NULL, FORMAT("%.2f%%", f.v_score * 100)) as service_delivery_pct_to_goal,
+
+    IF(UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' OR f.v_score IS NULL, NULL,
+      CASE 
+        WHEN f.v_score < 0.90 THEN 1
+        WHEN f.v_score < 1.00 THEN 2
+        WHEN f.v_score < 1.01 THEN 3
+        ELSE 4
+      END) AS service_delivery_points_obtained,
+
+    CASE 
+      WHEN UPPER(TRIM(f.kpi_applicable)) = 'NO' THEN 'N/A'
+      WHEN UPPER(TRIM(f.exempt)) = 'YES' THEN 'Exempt'
+      WHEN f.v_score IS NULL THEN NULL
+      WHEN f.v_score < 0.90 THEN 'Improvement Required'
+      WHEN f.v_score < 1.00 THEN 'Developing'
+      WHEN f.v_score < 1.01 THEN 'Achieving'
+      ELSE 'Excelling'
+    END AS service_delivery_status,
+
+    -- 6. Program Count and Dilution Metrics (Supports multi-program scaling)
+    COUNT(program) OVER(PARTITION BY tm_wdid, report_month, report_year) as final_total_programs,
+
+    IF(UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' OR f.v_score IS NULL, NULL,
+       (0.10 * (CASE WHEN f.v_score < 0.90 THEN 0.25 WHEN f.v_score < 1.00 THEN 0.50 WHEN f.v_score < 1.01 THEN 0.75 ELSE 1.00 END)) * SAFE_DIVIDE(1.0, NULLIF(COUNT(program) OVER(PARTITION BY tm_wdid, report_month, report_year), 0))) as service_delivery_weight_obtaiend_program_diluted,
+
+    -- 7. Earned Scorecard Weights & Points (Nullified if Exempt/NA)
+    IF(UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' OR f.v_score IS NULL, NULL,
+       FORMAT("%.2f%%", (0.10 * (CASE WHEN f.v_score < 0.90 THEN 0.25 WHEN f.v_score < 1.00 THEN 0.50 WHEN f.v_score < 1.01 THEN 0.75 ELSE 1.00 END)) * 100)) as service_delivery_earned_weight,
+
+    IF(UPPER(TRIM(f.kpi_applicable)) <> 'YES' OR UPPER(TRIM(f.exempt)) = 'YES' OR f.v_score IS NULL, NULL,
+       SAFE_CAST((CASE WHEN f.v_score < 0.90 THEN 1 WHEN f.v_score < 1.00 THEN 2 WHEN f.v_score < 1.01 THEN 3 ELSE 4 END) * 0.10 AS FLOAT64)) as service_delivery_points_obtained_for_final_score_only,
+
+    -- 8. Relational Lookup Key
+    CONCAT(report_year, '|', LEFT(report_month, 3), '|TL', tl_wdid, '|QA', tm_wdid, '|', program) as key
+
+  FROM final_math f;
+
+END;
