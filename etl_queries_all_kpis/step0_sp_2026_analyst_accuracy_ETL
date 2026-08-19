@@ -1,0 +1,264 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_analyst_accuracy_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_analyst_accuracy_ETL
+   DESCRIPTION: Master ETL pipeline for the 'Accuracy % to Goal' KPI across all Quality Analysts.
+                This process sanitizes data formats, aggregates performance counts (calibrations, 
+                disputes, audits), applies target benchmarks to active components, and calculates 
+                a unified multi-program Percentage to Goal. It also evaluates performance to 
+                determine the final achievement tier, obtained points, and dynamic scorecard weights.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_analyst_detailed` AS
+  
+  WITH 
+    /* =========================================================================================
+       CTE 1: DATA SANITIZATION
+       Extracts the raw dataset, standardizes timestamp strings, and casts numerical text fields
+       (containing commas) into operational FLOAT64 formats for accurate mathematical processing.
+    ========================================================================================= */
+    sanitized_data AS (
+      SELECT 
+        COALESCE(SAFE.PARSE_TIMESTAMP('%m/%d/%Y %H:%M:%S', timestamp), SAFE.PARSE_TIMESTAMP('%m/%d/%Y', timestamp)) as timestamp_clean,
+        submitter_email,
+        report_month,
+        SAFE_CAST(report_year AS INT64) as report_year,
+        tl_wdid,
+        tl_name,
+        tl_manager,
+        tl_sr_manager,
+        tm_wdid,
+        tm_name,
+        program,
+        country,
+        region,
+        SAFE_CAST(REPLACE(CAST(cal_accurate AS STRING), ',', '') AS FLOAT64) as cal_acc,
+        SAFE_CAST(REPLACE(CAST(cal_performed AS STRING), ',', '') AS FLOAT64) as cal_perf,
+        SAFE_CAST(REPLACE(CAST(valid_disputes AS STRING), ',', '') AS FLOAT64) as v_disp,
+        SAFE_CAST(REPLACE(CAST(total_completed_evals AS STRING), ',', '') AS FLOAT64) as t_evals,
+        SAFE_CAST(REPLACE(CAST(accurate_evals AS STRING), ',', '') AS FLOAT64) as a_evals,
+        notes,
+        kpi_applicable,
+        exempt,
+        reason,
+        calibrations_na,
+        disputes_na,
+        audits_na
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_raw`
+    ),
+
+    /* =========================================================================================
+       CTE 2: COMPONENT APPLICABILITY LOGIC
+       Assigns binary integers based on the applicability of the three core sub-components:
+       calibrations, disputes, and audits.
+    ========================================================================================= */
+    logic_processed AS (
+      SELECT 
+        *,
+        (CASE WHEN calibrations_na = 'Yes' THEN 1 ELSE 0 END +
+         CASE WHEN disputes_na = 'Yes' THEN 1 ELSE 0 END +
+         CASE WHEN audits_na = 'Yes' THEN 1 ELSE 0 END) as v_z
+      FROM sanitized_data
+    ),
+
+    /* =========================================================================================
+       CTE 3: PERFORMANCE AGGREGATION
+       Rolls up the sanitized counts by employee, program, and geographical footprint. Captures
+       the latest timestamp to ensure deduplication.
+    ========================================================================================= */
+    aggregated_data AS (
+      SELECT 
+        MAX(timestamp_clean) as timestamp,
+        submitter_email,
+        report_month,
+        report_year,
+        tl_wdid,
+        tl_name,
+        ANY_VALUE(tl_manager) as tl_manager,
+        ANY_VALUE(tl_sr_manager) as tl_sr_manager,
+        tm_wdid,
+        tm_name,
+        program,
+        country,
+        region,
+        SUM(cal_acc) as cal_acc_sum,
+        SUM(cal_perf) as cal_perf_sum,
+        SUM(v_disp) as v_disp_sum,
+        SUM(t_evals) as t_evals_sum,
+        SUM(a_evals) as a_evals_sum,
+        ANY_VALUE(notes) as notes,
+        kpi_applicable,
+        exempt,
+        reason,
+        calibrations_na,
+        disputes_na,
+        audits_na,
+        MAX(v_z) as v_z_sum
+      FROM logic_processed
+      GROUP BY 
+        submitter_email, report_month, report_year, tl_wdid, tl_name, 
+        tm_wdid, tm_name, program, country, region, 
+        kpi_applicable, exempt, reason, calibrations_na, disputes_na, audits_na
+    ),
+
+    /* =========================================================================================
+       CTE 4: METRIC BENCHMARKING & CALCULATIONS
+       Computes base rates for each operational component. Divides the base rates by their 
+       respective target benchmarks (0.90 for cal/evals, 0.975 for disputes) to generate the 
+       partial Percentage to Goal metrics.
+    ========================================================================================= */
+    calculated_metrics AS (
+      SELECT 
+        *,
+        
+        (UPPER(TRIM(kpi_applicable)) = 'NO' OR UPPER(TRIM(exempt)) = 'YES') as is_inapplicable_or_exempt,
+        
+        CASE 
+          WHEN UPPER(TRIM(kpi_applicable)) = 'NO' THEN 0
+          WHEN UPPER(TRIM(exempt)) = 'YES' THEN 0
+          ELSE (
+            (CASE WHEN UPPER(TRIM(calibrations_na)) = 'YES' THEN 1 ELSE 0 END) +
+            (CASE WHEN UPPER(TRIM(disputes_na)) = 'YES' THEN 1 ELSE 0 END) +
+            (CASE WHEN UPPER(TRIM(audits_na)) = 'YES' THEN 1 ELSE 0 END)
+          )
+        END as applicable_components_count,
+
+        COUNT(program) OVER(PARTITION BY tm_wdid, report_month, report_year) as total_programs_count,
+
+        SAFE_DIVIDE(cal_acc_sum, NULLIF(cal_perf_sum, 0)) as raw_cal_rate,
+        SAFE_DIVIDE(v_disp_sum, NULLIF(t_evals_sum, 0)) as raw_dispute_rate,
+        SAFE_DIVIDE(a_evals_sum, NULLIF(t_evals_sum, 0)) as raw_eval_rate,
+
+        IF(UPPER(TRIM(calibrations_na)) = 'YES', COALESCE(SAFE_DIVIDE(cal_acc_sum, NULLIF(cal_perf_sum, 0)) / 0.9, 0), 0) as cal_ptg_part,
+        IF(UPPER(TRIM(disputes_na)) = 'YES', COALESCE(SAFE_DIVIDE(t_evals_sum - v_disp_sum, NULLIF(t_evals_sum, 0)) / 0.975, 0), 0) as dispute_ptg_part,
+        IF(UPPER(TRIM(audits_na)) = 'YES', COALESCE(SAFE_DIVIDE(a_evals_sum, NULLIF(t_evals_sum, 0)) / 0.9, 0), 0) as eval_ptg_part
+      FROM aggregated_data
+    ),
+
+    /* =========================================================================================
+       CTE 5: UNIFIED SCORE DERIVATION
+       Calculates the final unrounded accuracy score by averaging the applicable benchmarked 
+       components.
+    ========================================================================================= */
+    derived_scores AS (
+      SELECT 
+        *,
+        IF(is_inapplicable_or_exempt OR applicable_components_count = 0, NULL,
+           SAFE_DIVIDE(cal_ptg_part + dispute_ptg_part + eval_ptg_part, NULLIF(applicable_components_count, 0))
+        ) as raw_accuracy_score
+      FROM calculated_metrics
+    )
+
+  /* =========================================================================================
+     FINAL OUTPUT: SCORECARD MAPPING & FORMATTING
+     Compiles the derived scores into scorecard-ready formats (percentages/text strings) and 
+     calculates the final achievement tiers, standard metric points, and diluted weights.
+  ========================================================================================= */
+  SELECT 
+    CONCAT(report_year, '|', report_month, '|TL', tl_wdid, '|QA', tm_wdid, '|', program) as key,
+    'CX Quality Analyst' as role, 
+    timestamp,
+    submitter_email,
+    report_month,
+    report_year,
+    tl_wdid,
+    tl_name,
+    tl_manager,
+    tl_sr_manager,
+    tm_wdid,
+    tm_name,
+    program,
+    country,
+    region,
+    
+    cal_acc_sum as cal_accurate,
+    cal_perf_sum as cal_performed,
+    v_disp_sum as valid_disputes,
+    t_evals_sum as total_completed_evals,
+    a_evals_sum as accurate_evals,
+    
+    notes,
+    kpi_applicable,
+    exempt,
+    reason,
+    calibrations_na,
+    disputes_na,
+    audits_na,
+    'My Business' as accuracy_business_category, 
+    'Accuracy % to Goal' as kpi,
+    IF(is_inapplicable_or_exempt, NULL, 0.95) as accuracy_target_master, 
+    IF(is_inapplicable_or_exempt, NULL, 0.15) AS accuracy_weight_master,
+    
+    applicable_components_count as accuracy_applicable_components_count,
+    total_programs_count as final_total_programs,
+
+    IF(is_inapplicable_or_exempt, NULL, FORMAT("%.2f%%", COALESCE(raw_cal_rate, 0) * 100)) as cal_accuracy_rate,
+    IF(is_inapplicable_or_exempt, NULL, FORMAT("%.2f%%", COALESCE(raw_dispute_rate, 0) * 100)) as dispute_rate,
+    IF(is_inapplicable_or_exempt, NULL, FORMAT("%.2f%%", COALESCE(raw_eval_rate, 0) * 100)) as eval_accuracy_rate,
+
+    IF(is_inapplicable_or_exempt OR UPPER(TRIM(calibrations_na)) = 'NO', NULL, FORMAT("%.2f%%", cal_ptg_part * 100)) as cal_ptg,
+    IF(is_inapplicable_or_exempt OR UPPER(TRIM(disputes_na)) = 'NO', NULL, FORMAT("%.2f%%", dispute_ptg_part * 100)) as dispute_ptg,
+    IF(is_inapplicable_or_exempt OR UPPER(TRIM(audits_na)) = 'NO', NULL, FORMAT("%.2f%%", eval_ptg_part * 100)) as eval_ptg,
+
+    IF(is_inapplicable_or_exempt OR raw_accuracy_score IS NULL, NULL, FORMAT("%.2f%%", raw_accuracy_score * 100)) as accuracy_pct_to_goal,
+
+    IF(is_inapplicable_or_exempt OR raw_accuracy_score IS NULL, NULL,
+       FORMAT("%.2f%%", 
+         (0.15 * 
+           CASE 
+             WHEN raw_accuracy_score < 0.90 THEN 0.25 
+             WHEN raw_accuracy_score < 0.95 THEN 0.50 
+             WHEN raw_accuracy_score < 0.96 THEN 0.75 
+             ELSE 1.00 
+           END
+         ) * 100
+       )
+    ) as accuracy_earned_weight,
+
+    IF(is_inapplicable_or_exempt OR raw_accuracy_score IS NULL, NULL,
+       CASE 
+         WHEN raw_accuracy_score < 0.90 THEN 'Improvement Required'
+         WHEN raw_accuracy_score < 0.95 THEN 'Developing'
+         WHEN raw_accuracy_score < 0.96 THEN 'Achieving'
+         ELSE 'Excelling'
+       END
+    ) as accuracy_achievement_category,
+
+    IF(is_inapplicable_or_exempt OR raw_accuracy_score IS NULL, NULL,
+       CASE 
+         WHEN raw_accuracy_score < 0.90 THEN 1
+         WHEN raw_accuracy_score < 0.95 THEN 2
+         WHEN raw_accuracy_score < 0.96 THEN 3
+         ELSE 4
+       END
+    ) as accuracy_points_obtained,
+
+    IF(is_inapplicable_or_exempt, NULL, SAFE_DIVIDE(1, NULLIF(total_programs_count, 0))) as accuracy_weight_diluted,
+
+    IF(is_inapplicable_or_exempt OR raw_accuracy_score IS NULL, NULL,
+       CAST((
+         CASE 
+           WHEN raw_accuracy_score < 0.90 THEN 1
+           WHEN raw_accuracy_score < 0.95 THEN 2
+           WHEN raw_accuracy_score < 0.96 THEN 3
+           ELSE 4
+         END * 0.15
+       ) AS FLOAT64)
+    ) as accuracy_points_obtained_for_final_score_only,
+
+    IF(is_inapplicable_or_exempt OR raw_accuracy_score IS NULL, NULL,
+      (IF(raw_accuracy_score > 1.0, 0.10, 0.15)) * 
+      (CASE 
+        WHEN raw_accuracy_score < 0.90 THEN 0.25
+        WHEN raw_accuracy_score < 0.95 THEN 0.50
+        WHEN raw_accuracy_score < 0.96 THEN 0.75
+        ELSE 1.00
+      END) * 
+      SAFE_DIVIDE(1.0, NULLIF(total_programs_count, 0))
+    ) AS accuracy_weight_obtaiend_program_diluted
+
+  FROM derived_scores
+  ORDER BY final_total_programs DESC;
+
+END;
