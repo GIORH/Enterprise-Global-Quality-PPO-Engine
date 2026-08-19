@@ -1,0 +1,247 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_manager_trustandsafety_qualitypercenttogoal_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_manager_trustandsafety_qualitypercenttogoal_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Quality % to Goal' KPI for Trust & Safety 
+                Managers and Senior Managers (20% Weight). The procedure uses a dual-branch 
+                architecture to roll up granular analyst quality scores up to both management 
+                hierarchy levels. It evaluates team-wide exemption flags, averages quality actuals 
+                and targets, computes the Percentage to Goal (PTG), maps results to standard continuous 
+                achievement tiers (<90%, <100%, <101%, >=101%), and calculates final weighted scorecard impacts.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_manager_trustandsafety_qualitypercenttogoal_ETL` AS
+
+  /* ==============================================================================================
+     BRANCH 1: TRUST & SAFETY QUALITY MANAGER ROLL-UP
+     ============================================================================================== */
+  
+  /* CTE 1.1: MANAGER LEVEL AGGREGATION & EXEMPTION CONTROL
+     Averages granular quality actuals and targets grouped at the Manager, program, and regional 
+     footprint level. Evaluates analyst-level flags to set team-wide exemption status, safely 
+     omitting exempt individual records to avoid score dilution. */
+  WITH Manager_Quality_Source AS (
+    SELECT
+      MAX(timestamp) AS timestamp,
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      report_month,
+      report_year,
+      tl_manager,
+      tl_sr_manager,
+      program,
+      country,
+      region,
+      
+      AVG(CASE WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(quality_score_actual AS FLOAT64) END) AS quality_score_actual,
+      AVG(CASE WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(quality_score_target_program AS FLOAT64) END) AS quality_score_target_program,
+      
+      IF(COUNTIF(UPPER(TRIM(qa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS qa_kpi_applicable,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS qa_exempt,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), 'Whole roll-up team exempt', NULL) AS quality_notes,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), MAX(qa_reason), NULL) AS qa_reason
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+    GROUP BY report_month, report_year, tl_manager, tl_sr_manager, program, country, region
+  ),
+
+  /* CTE 1.2: MANAGER BENCHMARKING & RATIO CALCULATION
+     Injects scorecard metadata (20% master weight, business category) and computes the Manager-level 
+     Quality Percentage to Goal (PTG) based on active actuals vs targets. */
+  Manager_Quality_PTG AS (
+    SELECT
+      * EXCEPT(quality_score_target_program),
+      'My Customer' AS qaptg_business_category,
+      'Quality % to Goal' AS qa_kpi,
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE quality_score_target_program 
+      END AS quality_score_target_program,
+      
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS quality_weight_master,
+      
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(quality_score_actual, quality_score_target_program) 
+      END AS quality_ptg
+    FROM Manager_Quality_Source
+  ),
+
+  /* CTE 1.3: MANAGER METRIC TIERING & POINT ALLOCATION
+     Maps computed PTG against continuous performance thresholds (<90%, <100%, <101%, >=101%) 
+     to assign official Achievement Tiers and continuous 4-point scale metric points. */
+  Manager_Quality_Scores AS (
+    SELECT
+      *,
+      CASE 
+        WHEN quality_ptg IS NULL THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN quality_ptg < 1.00 THEN 'Developing' 
+        WHEN quality_ptg < 1.01 THEN 'Achieving' 
+        WHEN quality_ptg >= 1.01 THEN 'Excelling' 
+        ELSE NULL 
+      END AS quality_achievement_tier,
+      
+      CASE 
+        WHEN quality_ptg IS NULL THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 1 
+        WHEN quality_ptg < 1.00 THEN 2 
+        WHEN quality_ptg < 1.01 THEN 3 
+        WHEN quality_ptg >= 1.01 THEN 4 
+        ELSE 0 
+      END AS quality_points_obtained
+    FROM Manager_Quality_PTG
+  ),
+
+  /* CTE 1.4: MANAGER WEIGHT DISTRIBUTION & SCORING
+     Translates 4-point scale metric points into quartered weight distributions against the 
+     20% master weight. Calculates final numerical point contributions for the Manager tier. */
+  Manager_Quality_Final_Block AS (
+    SELECT
+      timestamp,
+      date,
+      report_month,
+      report_year,
+      tl_manager,
+      tl_sr_manager,
+      program,
+      country,
+      region,
+      qaptg_business_category,
+      qa_kpi,
+      quality_score_actual,
+      quality_score_target_program,
+      quality_weight_master,
+      quality_ptg,
+      quality_achievement_tier,
+      quality_points_obtained,
+      CASE WHEN quality_points_obtained IS NULL THEN NULL ELSE (quality_points_obtained / 4) * quality_weight_master END AS quality_weight_obtained,
+      CASE WHEN quality_points_obtained IS NULL THEN NULL ELSE quality_points_obtained * quality_weight_master END AS quality_points_final_score,
+      quality_notes,
+      qa_kpi_applicable,
+      qa_exempt,
+      qa_reason
+    FROM Manager_Quality_Scores
+  ),
+
+  /* ==============================================================================================
+     BRANCH 2: TRUST & SAFETY QUALITY SENIOR MANAGER ROLL-UP
+     ============================================================================================== */
+  
+  /* CTE 2.1: SR. MANAGER LEVEL AGGREGATION & EXEMPTION CONTROL
+     Averages granular quality actuals and targets grouped at the Senior Manager level, re-mapping 
+     `tl_sr_manager` to `tl_manager`. Filters for active Senior Manager records. */
+  SrManager_Quality_Source AS (
+    SELECT
+      MAX(timestamp) AS timestamp,
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      report_month,
+      report_year,
+      tl_sr_manager AS tl_manager,
+      program,
+      country,
+      region,
+      
+      AVG(CASE WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(quality_score_actual AS FLOAT64) END) AS quality_score_actual,
+      AVG(CASE WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(quality_score_target_program AS FLOAT64) END) AS quality_score_target_program,
+      
+      IF(COUNTIF(UPPER(TRIM(qa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS qa_kpi_applicable,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS qa_exempt,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), 'Whole roll-up team exempt', NULL) AS quality_notes,
+      IF(COUNTIF(UPPER(TRIM(qa_exempt)) = 'YES') = COUNT(*), MAX(qa_reason), NULL) AS qa_reason
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+    WHERE tl_sr_manager IS NOT NULL AND TRIM(tl_sr_manager) != ''
+    GROUP BY report_month, report_year, tl_sr_manager, program, country, region
+  ),
+
+  /* CTE 2.2: SR. MANAGER BENCHMARKING & RATIO CALCULATION
+     Injects scorecard metadata and computes the Percentage to Goal (PTG) for the Senior Manager level. */
+  SrManager_Quality_PTG AS (
+    SELECT
+      * EXCEPT(quality_score_target_program),
+      'My Customer' AS qaptg_business_category,
+      'Quality % to Goal' AS qa_kpi,
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE quality_score_target_program 
+      END AS quality_score_target_program,
+      
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS quality_weight_master,
+      
+      CASE 
+        WHEN UPPER(TRIM(qa_kpi_applicable)) = 'NO' OR UPPER(TRIM(qa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(quality_score_actual, quality_score_target_program) 
+      END AS quality_ptg
+    FROM SrManager_Quality_Source
+  ),
+
+  /* CTE 2.3: SR. MANAGER METRIC TIERING & POINT ALLOCATION
+     Maps Senior Manager PTG to official Achievement Tiers and continuous 4-point scale metric points. */
+  SrManager_Quality_Scores AS (
+    SELECT
+      *,
+      CASE 
+        WHEN quality_ptg IS NULL THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 'Improvement Required' 
+        WHEN quality_ptg < 1.00 THEN 'Developing' 
+        WHEN quality_ptg < 1.01 THEN 'Achieving' 
+        WHEN quality_ptg >= 1.01 THEN 'Excelling' 
+        ELSE NULL 
+      END AS quality_achievement_tier,
+      
+      CASE 
+        WHEN quality_ptg IS NULL THEN NULL 
+        WHEN quality_ptg < 0.90 THEN 1 
+        WHEN quality_ptg < 1.00 THEN 2 
+        WHEN quality_ptg < 1.01 THEN 3 
+        WHEN quality_ptg >= 1.01 THEN 4 
+        ELSE 0 
+      END AS quality_points_obtained
+    FROM SrManager_Quality_PTG
+  ),
+
+  /* CTE 2.4: SR. MANAGER WEIGHT DISTRIBUTION & SCORING
+     Finalizes calculations for the Senior Manager layer, projecting `tl_sr_manager` as NULL 
+     to maintain hierarchical schema consistency. */
+  SrManager_Quality_Final_Block AS (
+    SELECT
+      timestamp,
+      date,
+      report_month,
+      report_year,
+      tl_manager,
+      CAST(NULL AS STRING) AS tl_sr_manager,
+      program,
+      country,
+      region,
+      qaptg_business_category,
+      qa_kpi,
+      quality_score_actual,
+      quality_score_target_program,
+      quality_weight_master,
+      quality_ptg,
+      quality_achievement_tier,
+      quality_points_obtained,
+      CASE WHEN quality_points_obtained IS NULL THEN NULL ELSE (quality_points_obtained / 4) * quality_weight_master END AS quality_weight_obtained,
+      CASE WHEN quality_points_obtained IS NULL THEN NULL ELSE quality_points_obtained * quality_weight_master END AS quality_points_final_score,
+      quality_notes,
+      qa_kpi_applicable,
+      qa_exempt,
+      qa_reason
+    FROM SrManager_Quality_Scores
+  )
+
+  /* ==============================================================================================
+     FINAL MASTER UNION
+     Combines Manager and Senior Manager rolled-up Quality datasets into a single unified table output.
+     ============================================================================================== */
+  SELECT * FROM Manager_Quality_Final_Block
+  UNION ALL
+  SELECT * FROM SrManager_Quality_Final_Block;
+
+END;
