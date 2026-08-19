@@ -1,0 +1,129 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_accuracypercenttogoal_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_lead_accuracypercenttogoal_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Accuracy % to Goal' KPI from the Analyst 
+                level up to the CX Quality Team Lead hierarchy. It dynamically tracks active 
+                operational footprints (program, country, region) to allocate diluted scorecard 
+                weights. Evaluates rolled-up performance against the 0.95 target master and 
+                standard 10% metric weight.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_team_lead_detailed` AS
+  
+  /* =========================================================================================
+     CTE 1: HIERARCHICAL FOOTPRINT TRACKING
+     Determines the exact number of applicable, non-exempt operational footprint combinations 
+     (Program + Country + Region) managed by each Team Lead. This distinct count drives the 
+     multi-program weight dilution logic downstream. Ensures relational key consistency.
+  ========================================================================================= */
+  WITH ProgramCounts AS (
+    SELECT 
+      CAST(tl_wdid AS STRING) as tl_wdid, 
+      CAST(report_month AS STRING) as report_month, 
+      CAST(report_year AS STRING) as report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(TRIM(kpi_applicable)) = 'YES' AND UPPER(TRIM(exempt)) = 'NO' THEN CONCAT(program, COALESCE(country, ''), COALESCE(region, '')) END) AS final_total_programs
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  /* =========================================================================================
+     CTE 2: ANALYST-TO-LEAD METRIC AGGREGATION
+     Rolls up the analyst-level granular data into a unified Team Lead view. Consolidates 
+     applicability flags and aggregates raw count metrics exclusively for active, non-exempt 
+     analysts to protect the integrity of the hierarchical score average.
+  ========================================================================================= */
+  AggregatedData AS (
+    SELECT 
+      'CX Quality Team Lead and Sr Team lead' AS role,
+      MAX(timestamp) AS timestamp,
+      MAX(submitter_email) AS submitter_email,
+      CAST(report_month AS STRING) as report_month,
+      CAST(report_year AS STRING) as report_year,
+      CAST(tl_wdid AS STRING) as tl_wdid,
+      tl_name,
+      ANY_VALUE(tl_manager) AS tl_manager,
+      ANY_VALUE(tl_sr_manager) AS tl_sr_manager,
+      program,
+      country,
+      region,
+      'My Business' as accuracy_business_category,
+      'Accuracy % to Goal' as accuracy_kpi,
+      
+      -- Consolidates analyst-level flags to determine Team Lead metric applicability
+      IF(COUNTIF(LOWER(TRIM(kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS accuracy_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(exempt)) = 'no') > 0, 'No', 'Yes') AS accuracy_exempt,
+      MAX(CASE WHEN LOWER(TRIM(exempt)) = 'yes' THEN reason ELSE NULL END) AS accuracy_reason,
+      
+      -- Quantitative aggregations safely excluding exempt analysts
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN cal_accurate ELSE NULL END) as cal_accurate,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN cal_performed ELSE NULL END) as cal_performed,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN valid_disputes ELSE NULL END) as valid_disputes,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN total_completed_evals ELSE NULL END) as total_completed_evals,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN accurate_evals ELSE NULL END) as accurate_evals,
+
+      AVG(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(REPLACE(accuracy_pct_to_goal, '%', '') AS FLOAT64) ELSE NULL END) / 100 as _accuracy_score_avg
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_analyst_detailed`
+    GROUP BY 4,5,6,7,10,11,12
+  ),
+
+  /* =========================================================================================
+     CTE 3: METRIC BENCHMARKING & POINT ALLOCATION
+     Merges the aggregated metrics with the operational footprint counts. Injects standard 
+     scorecard metadata (0.95 target, 10% weight) and evaluates the hierarchical average score 
+     against continuous performance thresholds to assign the base metric points (1-4).
+  ========================================================================================= */
+  CalculatedLevels AS (
+    SELECT 
+      ad.*,
+      pc.final_total_programs,
+      
+      IF(ad.accuracy_kpi_applicable = 'No' OR ad.accuracy_exempt = 'Yes', NULL, 0.95) as accuracy_target_master,
+      IF(ad.accuracy_exempt = 'Yes', NULL, 0.10) as accuracy_weight_master,
+      
+      IF(ad.accuracy_exempt = 'Yes', NULL, FORMAT("%.2f%%", ad._accuracy_score_avg * 100)) as accuracy_pct_to_goal,
+
+      IF(ad.accuracy_exempt = 'Yes', NULL, 
+        CASE 
+          WHEN ad._accuracy_score_avg < 0.90 THEN 1
+          WHEN ad._accuracy_score_avg < 0.95 THEN 2
+          WHEN ad._accuracy_score_avg < 0.96 THEN 3
+          ELSE 4
+        END) as accuracy_points_obtained
+    FROM AggregatedData ad
+    LEFT JOIN ProgramCounts pc 
+      ON ad.tl_wdid = pc.tl_wdid 
+      AND ad.report_month = pc.report_month 
+      AND ad.report_year = pc.report_year
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: SCORECARD MAPPING & DILUTION
+     Finalizes the scorecard presentation layer. Maps the earned points to standardized 
+     Achievement Categories. Computes the final numerical points, formatted earned weight 
+     percentages, and the program-diluted weight distribution essential for multi-program scorecards.
+  ========================================================================================= */
+  SELECT 
+    * EXCEPT(_accuracy_score_avg),
+    
+    CASE 
+      WHEN accuracy_exempt = 'Yes' THEN NULL
+      WHEN accuracy_points_obtained = 1 THEN 'Improvement Required'
+      WHEN accuracy_points_obtained = 2 THEN 'Developing'
+      WHEN accuracy_points_obtained = 3 THEN 'Achieving'
+      ELSE 'Excelling'
+    END as accuracy_achievement_category,
+
+    -- Numerical points derived for final global score aggregation
+    IF(accuracy_exempt = 'Yes', NULL, SAFE_CAST(accuracy_points_obtained * 0.10 AS FLOAT64)) as accuracy_points_obtained_for_final_score_only,
+
+    -- Quartered mathematical weight evaluation formatted for presentation
+    IF(accuracy_exempt = 'Yes', NULL, FORMAT("%.2f%%", (0.10 * (accuracy_points_obtained * 0.25)) * 100)) as accuracy_earned_weight,
+
+    -- Dilutes the earned weight proportionally across the active managed footprint
+    IF(accuracy_exempt = 'Yes', NULL, (0.10 * (accuracy_points_obtained * 0.25)) * SAFE_DIVIDE(1.0, final_total_programs)) as accuracy_weight_diluted
+
+  FROM CalculatedLevels;
+
+END;
