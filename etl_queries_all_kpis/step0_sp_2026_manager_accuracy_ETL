@@ -1,0 +1,244 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_manager_accuracy_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_manager_accuracy_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Accuracy % to Goal' KPI for CX Quality Managers 
+                and Senior Managers (10% Weight). The procedure uses a dual-branch structure to 
+                extract Workday IDs and names from raw hierarchical strings via regular expressions, 
+                rolls up analyst-level metrics for both Manager and Sr. Manager roles, evaluates 
+                performance against the 0.95 target benchmark, and calculates diluted scorecard weights.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_manager_detailed` AS
+  
+  /* ==============================================================================================
+     BRANCH 1: CX QUALITY MANAGER ROLL-UP
+     ============================================================================================== */
+  
+  /* CTE 1.1: MANAGER BASE EXTRACTION
+     Extracts the Manager Workday ID and clean Manager Name from concatenated string fields using 
+     regex parsing from the analyst-level detailed source dataset. */
+  WITH ManagerBase AS (
+    SELECT 
+      *,
+      REGEXP_EXTRACT(tl_manager, r'\((\d+)\)\s*$') AS wdid_manager,
+      TRIM(REGEXP_EXTRACT(tl_manager, r'^(.*?)\s*\(\d+\)\s*$')) AS manager_name
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_analyst_detailed`
+  ),
+
+  /* CTE 1.2: MANAGER FOOTPRINT TRACKING
+     Calculates the number of active, non-exempt operational footprint combinations (Program + 
+     Country + Region) managed by each Manager per month for downstream weight dilution. */
+  ProgramCounts AS (
+    SELECT 
+      CAST(wdid_manager AS STRING) AS wdid_manager, 
+      CAST(report_month AS STRING) AS report_month, 
+      CAST(report_year AS STRING) AS report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(TRIM(kpi_applicable)) = 'YES' AND UPPER(TRIM(exempt)) = 'NO' THEN CONCAT(program, COALESCE(country, ''), COALESCE(region, '')) END) AS final_total_programs
+    FROM ManagerBase
+    GROUP BY 1, 2, 3
+  ),
+
+  /* CTE 1.3: MANAGER METRIC AGGREGATION
+     Rolls up analyst-level accuracy metrics to the Manager level. Consolidates applicability and 
+     exemption flags, and sums raw counts (calibrations, disputes, evaluations) while safely 
+     excluding exempt records to protect the accuracy score average. */
+  AggregatedData AS (
+    SELECT 
+      'CX Quality Manager and Sr Manager' AS role,
+      MAX(timestamp) AS timestamp,
+      CAST(report_month AS STRING) AS report_month,
+      CAST(report_year AS STRING) AS report_year,
+      manager_name,
+      CAST(wdid_manager AS STRING) AS wdid_manager,
+      tl_sr_manager,
+      program,
+      country,
+      region,
+      'My Business' as accuracy_business_category,
+      'Accuracy % to Goal' as kpi,
+      
+      IF(COUNTIF(LOWER(TRIM(kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS accuracy_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(exempt)) = 'no') > 0, 'No', 'Yes') AS accuracy_exempt,
+      MAX(CASE WHEN LOWER(TRIM(exempt)) = 'yes' THEN reason ELSE NULL END) AS accuracy_reason,
+      
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN cal_accurate ELSE NULL END) as cal_accurate,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN cal_performed ELSE NULL END) as cal_performed,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN valid_disputes ELSE NULL END) as valid_disputes,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN total_completed_evals ELSE NULL END) as total_completed_evals,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN accurate_evals ELSE NULL END) as accurate_evals,
+
+      AVG(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(REPLACE(accuracy_pct_to_goal, '%', '') AS FLOAT64) ELSE NULL END) / 100 as _accuracy_score_avg
+    FROM ManagerBase
+    GROUP BY 3,4,5,6,7,8,9,10
+  ),
+
+  /* CTE 1.4: MANAGER BENCHMARKING & POINT ALLOCATION
+     Injects scorecard metadata (0.95 target master, 10% weight master) and evaluates the average 
+     accuracy score against standard thresholds (<90%, <95%, <96%, >=96%) to assign 1-4 metric points. */
+  CalculatedLevels AS (
+    SELECT 
+      ad.*,
+      pc.final_total_programs,
+      IF(ad.accuracy_kpi_applicable = 'No' OR ad.accuracy_exempt = 'Yes', NULL, 0.95) as accuracy_target_master,
+      IF(ad.accuracy_exempt = 'Yes', NULL, 0.10) as accuracy_weight_master,
+      
+      IF(ad.accuracy_exempt = 'Yes', NULL, FORMAT("%.2f%%", ad._accuracy_score_avg * 100)) as accuracy_pct_to_goal,
+
+      IF(ad.accuracy_exempt = 'Yes', NULL, 
+        CASE 
+          WHEN ad._accuracy_score_avg < 0.90 THEN 1
+          WHEN ad._accuracy_score_avg < 0.95 THEN 2
+          WHEN ad._accuracy_score_avg < 0.96 THEN 3
+          ELSE 4
+        END) as accuracy_points_obtained
+    FROM AggregatedData ad
+    LEFT JOIN ProgramCounts pc 
+      ON ad.wdid_manager = pc.wdid_manager 
+      AND ad.report_month = pc.report_month 
+      AND ad.report_year = pc.report_year
+  ),
+
+  /* CTE 1.5: MANAGER WEIGHT DISTRIBUTION
+     Finalizes the Manager layer by mapping metric points to Achievement Categories, computing 
+     numerical score contributions, and calculating program-diluted weights. */
+  ManagerFinalData AS (
+    SELECT 
+      * EXCEPT(_accuracy_score_avg),
+      
+      CASE 
+        WHEN accuracy_exempt = 'Yes' THEN NULL
+        WHEN accuracy_points_obtained = 1 THEN 'Improvement Required'
+        WHEN accuracy_points_obtained = 2 THEN 'Developing'
+        WHEN accuracy_points_obtained = 3 THEN 'Achieving'
+        ELSE 'Excelling'
+      END as accuracy_achievement_category,
+
+      IF(accuracy_exempt = 'Yes', NULL, SAFE_CAST(accuracy_points_obtained * 0.10 AS FLOAT64)) as accuracy_points_obtained_for_final_score_only,
+
+      IF(accuracy_exempt = 'Yes', NULL, FORMAT("%.2f%%", (0.10 * (accuracy_points_obtained * 0.25)) * 100)) as accuracy_earned_weight,
+
+      IF(accuracy_exempt = 'Yes', NULL, (0.10 * (accuracy_points_obtained * 0.25)) * SAFE_DIVIDE(1.0, final_total_programs)) as accuracy_weight_diluted
+
+    FROM CalculatedLevels
+  ),
+
+  /* ==============================================================================================
+     BRANCH 2: CX SENIOR MANAGER ROLL-UP
+     ============================================================================================== */
+
+  /* CTE 2.1: SR. MANAGER BASE EXTRACTION
+     Extracts Senior Manager Workday ID and clean Senior Manager Name from the raw hierarchy string. 
+     Filters exclusively for active Senior Manager records. */
+  SrManagerBase AS (
+    SELECT 
+      * EXCEPT(tl_sr_manager),
+      CAST(NULL AS STRING) AS tl_sr_manager, 
+      REGEXP_EXTRACT(tl_sr_manager, r'\((\d+)\)\s*$') AS wdid_manager,
+      TRIM(REGEXP_EXTRACT(tl_sr_manager, r'^(.*?)\s*\(\d+\)\s*$')) AS manager_name
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_analyst_detailed`
+    WHERE tl_sr_manager IS NOT NULL AND TRIM(tl_sr_manager) != ''
+  ),
+
+  /* CTE 2.2: SR. MANAGER FOOTPRINT TRACKING
+     Calculates the total distinct active program footprint managed across the Senior Manager's organization. */
+  SrProgramCounts AS (
+    SELECT 
+      CAST(wdid_manager AS STRING) AS wdid_manager, 
+      CAST(report_month AS STRING) AS report_month, 
+      CAST(report_year AS STRING) AS report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(TRIM(kpi_applicable)) = 'YES' AND UPPER(TRIM(exempt)) = 'NO' THEN CONCAT(program, COALESCE(country, ''), COALESCE(region, '')) END) AS final_total_programs
+    FROM SrManagerBase
+    GROUP BY 1, 2, 3
+  ),
+
+  /* CTE 2.3: SR. MANAGER METRIC AGGREGATION
+     Aggregates analyst-level accuracy metrics up to the Senior Manager hierarchy level. */
+  SrAggregatedData AS (
+    SELECT 
+      'CX Quality Manager and Sr Manager' AS role,
+      MAX(timestamp) AS timestamp,
+      CAST(report_month AS STRING) AS report_month,
+      CAST(report_year AS STRING) AS report_year,
+      manager_name,
+      CAST(wdid_manager AS STRING) AS wdid_manager,
+      tl_sr_manager,
+      program,
+      country,
+      region,
+      'My Business' as accuracy_business_category,
+      'Accuracy % to Goal' as kpi,
+      
+      IF(COUNTIF(LOWER(TRIM(kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS accuracy_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(exempt)) = 'no') > 0, 'No', 'Yes') AS accuracy_exempt,
+      MAX(CASE WHEN LOWER(TRIM(exempt)) = 'yes' THEN reason ELSE NULL END) AS accuracy_reason,
+      
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN cal_accurate ELSE NULL END) as cal_accurate,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN cal_performed ELSE NULL END) as cal_performed,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN valid_disputes ELSE NULL END) as valid_disputes,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN total_completed_evals ELSE NULL END) as total_completed_evals,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN accurate_evals ELSE NULL END) as accurate_evals,
+
+      AVG(CASE WHEN LOWER(TRIM(exempt)) = 'no' THEN SAFE_CAST(REPLACE(accuracy_pct_to_goal, '%', '') AS FLOAT64) ELSE NULL END) / 100 as _accuracy_score_avg
+    FROM SrManagerBase
+    GROUP BY 3,4,5,6,7,8,9,10
+  ),
+
+  /* CTE 2.4: SR. MANAGER BENCHMARKING & POINT ALLOCATION
+     Evaluates aggregated Senior Manager performance against standard accuracy thresholds. */
+  SrCalculatedLevels AS (
+    SELECT 
+      ad.*,
+      pc.final_total_programs,
+      IF(ad.accuracy_kpi_applicable = 'No' OR ad.accuracy_exempt = 'Yes', NULL, 0.95) as accuracy_target_master,
+      IF(ad.accuracy_exempt = 'Yes', NULL, 0.10) as accuracy_weight_master,
+      
+      IF(ad.accuracy_exempt = 'Yes', NULL, FORMAT("%.2f%%", ad._accuracy_score_avg * 100)) as accuracy_pct_to_goal,
+
+      IF(ad.accuracy_exempt = 'Yes', NULL, 
+        CASE 
+          WHEN ad._accuracy_score_avg < 0.90 THEN 1
+          WHEN ad._accuracy_score_avg < 0.95 THEN 2
+          WHEN ad._accuracy_score_avg < 0.96 THEN 3
+          ELSE 4
+        END) as accuracy_points_obtained
+    FROM SrAggregatedData ad
+    LEFT JOIN SrProgramCounts pc 
+      ON ad.wdid_manager = pc.wdid_manager 
+      AND ad.report_month = pc.report_month 
+      AND ad.report_year = pc.report_year
+  ),
+
+  /* CTE 2.5: SR. MANAGER WEIGHT DISTRIBUTION
+     Finalizes the Senior Manager layer calculations and weight dilution. */
+  SrManagerFinalData AS (
+    SELECT 
+      * EXCEPT(_accuracy_score_avg),
+      
+      CASE 
+        WHEN accuracy_exempt = 'Yes' THEN NULL
+        WHEN accuracy_points_obtained = 1 THEN 'Improvement Required'
+        WHEN accuracy_points_obtained = 2 THEN 'Developing'
+        WHEN accuracy_points_obtained = 3 THEN 'Achieving'
+        ELSE 'Excelling'
+      END as accuracy_achievement_category,
+
+      IF(accuracy_exempt = 'Yes', NULL, SAFE_CAST(accuracy_points_obtained * 0.10 AS FLOAT64)) as accuracy_points_obtained_for_final_score_only,
+
+      IF(accuracy_exempt = 'Yes', NULL, FORMAT("%.2f%%", (0.10 * (accuracy_points_obtained * 0.25)) * 100)) as accuracy_earned_weight,
+
+      IF(accuracy_exempt = 'Yes', NULL, (0.10 * (accuracy_points_obtained * 0.25)) * SAFE_DIVIDE(1.0, final_total_programs)) as accuracy_weight_diluted
+
+    FROM SrCalculatedLevels
+  )
+
+  /* ==============================================================================================
+     FINAL MASTER UNION
+     Combines Manager and Senior Manager rolled-up datasets into a single unified table output.
+     ============================================================================================== */
+  SELECT * FROM ManagerFinalData
+  UNION ALL
+  SELECT * FROM SrManagerFinalData;
+
+END;
