@@ -1,0 +1,324 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step3_sp_2026_unpivot_quality_director`()
+BEGIN
+
+    /************************************************************************************************
+     PROCEDURE: step3_sp_2026_unpivot_quality_director
+     DESCRIPTION: Master unpivot transformation procedure for the QA Director Scorecard[cite: 23]. 
+                  Transforms consolidated wide-format metrics (SEI, POTP, YETG, Coaching, Final Score) 
+                  into a standardized 22-column long-format layout aligned with Regional Lead reporting[cite: 23]. 
+                  Integrates dynamic "Global Operations" fallback handling for program placeholders[cite: 23] 
+                  and enforces a 3-Level Row Level Security (RLS) model driven by roster organizational 
+                  chains and privileged system email lists[cite: 23].
+    ************************************************************************************************/
+
+    CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_director_unpivoted` AS
+
+    WITH 
+        /* =========================================================================================
+           CTE 1: DYNAMIC FULL ACCESS EMAIL CONSOLIDATION
+           Aggregates privileged system emails across Telus Digital and Telus International sources 
+           to construct a universal RLS bypass list[cite: 23].
+        ========================================================================================= */
+        full_access_list AS (
+          SELECT STRING_AGG(email, ',') AS full_access_emails
+          FROM (
+            SELECT LOWER(TRIM(telus_digital_email)) AS email 
+            FROM `ti-ca-ml-start.QA_Training_scorecards.2026_full_access_security_emails_raw` 
+            WHERE telus_digital_email IS NOT NULL AND TRIM(telus_digital_email) != ''
+            
+            UNION DISTINCT
+            
+            SELECT LOWER(TRIM(telus_international_email)) AS email 
+            FROM `ti-ca-ml-start.QA_Training_scorecards.2026_full_access_security_emails_raw` 
+            WHERE telus_international_email IS NOT NULL AND TRIM(telus_international_email) != ''
+          )
+        ),
+
+        /* =========================================================================================
+           CTE 2: HISTORICAL ROSTER SECURITY MAPPING
+           Extracts historical global roster supervisory chains per Director Workday ID, Month, and Year[cite: 23]. 
+           Standardizes employee IDs and month keys, aggregating up to 6 levels of management emails[cite: 23].
+        ========================================================================================= */
+        roster_security AS (
+          SELECT 
+            REGEXP_REPLACE(TRIM(CAST(employee_id AS STRING)), r'\.0$', '') AS employee_id_std,
+            UPPER(TRIM(SUBSTR(CAST(month AS STRING), 1, 3))) AS month_std,
+            SAFE_CAST(year AS STRING) AS year_std,
+            LOWER(TRIM(email_primary_work)) AS evaluated_email,
+            LOWER(TRIM(inmediate_supervisor_1_email)) AS supervisor_1_email,
+            ARRAY_TO_STRING(
+              ARRAY(
+                SELECT DISTINCT email
+                FROM UNNEST([
+                  LOWER(TRIM(email_primary_work)),
+                  LOWER(TRIM(inmediate_supervisor_1_email)),
+                  LOWER(TRIM(inmediate_supervisor_2_email)),
+                  LOWER(TRIM(inmediate_supervisor_3_email)),
+                  LOWER(TRIM(inmediate_supervisor_4_email)),
+                  LOWER(TRIM(inmediate_supervisor_5_email)),
+                  LOWER(TRIM(inmediate_supervisor_6_email))
+                ]) AS email
+                WHERE email IS NOT NULL AND TRIM(email) != ''
+              ), ','
+            ) AS full_chain_emails
+          FROM `ti-ca-ml-start.QA_Training_scorecards.2026_historical_qa_global_roster_proposal_raw`
+          WHERE employee_id IS NOT NULL 
+            AND TRIM(CAST(employee_id AS STRING)) NOT IN ('', '-', 'NULL')
+          QUALIFY ROW_NUMBER() OVER(
+            PARTITION BY 
+              REGEXP_REPLACE(TRIM(CAST(employee_id AS STRING)), r'\.0$', ''),
+              UPPER(TRIM(SUBSTR(CAST(month AS STRING), 1, 3))),
+              SAFE_CAST(year AS STRING)
+            ORDER BY employee_id
+          ) = 1
+        ),
+
+        /* =========================================================================================
+           CTE 3: CONSOLIDATED DIRECTOR SOURCE SELECTION
+           Filters out null Director Workday IDs from the consolidated scorecard source table[cite: 23].
+        ========================================================================================= */
+        source AS (
+            SELECT * FROM `ti-ca-ml-start.QA_Training_scorecards.2026_scorecard_qa_director_consolidated`
+            WHERE director_wdid IS NOT NULL
+        ),
+
+        /* =========================================================================================
+           CTE 4: UNPIVOT TRANSFORMATIONS
+           Unpivots executive performance blocks (SEI, POTP, YETG, Coaching, Final Score) into a 
+           standardized long format[cite: 23]. Standardizes numeric types to FLOAT64 and enforces June-only 
+           evaluations for YETG[cite: 23].
+        ========================================================================================= */
+        Unpivoted_Metrics AS (
+            /* --- 1. SEI PERFORMANCE BLOCK --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))) AS performance_date,
+                report_year,
+                report_month,
+                
+                role AS position_role,
+                SAFE_CAST(director_wdid AS STRING) AS employee_id,
+                director_name AS quality_team_member,
+                
+                -- Master Dimensional Homologation (Null placeholders aligned to Regional Lead format)
+                region,
+                CAST(NULL AS STRING) AS country,
+                CAST(NULL AS STRING) AS program,
+                CAST(NULL AS STRING) AS cost_center,
+                CAST(NULL AS STRING) AS immediate_supervisor,
+                CAST(NULL AS STRING) AS immediate_manager,
+                CAST(NULL AS STRING) AS immediate_sr_manager,
+                
+                sei_kpi AS kpi,
+                sei_business_category AS business_category,
+                
+                SAFE_CAST(REPLACE(CAST(sei_target AS STRING), '%', '') AS FLOAT64) / 100 AS target,
+                SAFE_CAST(REPLACE(CAST(sei_ptg AS STRING), '%', '') AS FLOAT64) / 100 AS target_obtained,
+                
+                SAFE_CAST(sei_points_obtained AS FLOAT64) AS metric_points,
+                SAFE_CAST(sei_weight AS FLOAT64) AS weight,
+                SAFE_CAST(sei_weight_obtained AS FLOAT64) AS weight_obtained, 
+                sei_achievement_category AS tier,
+                SAFE_CAST(sei_points_final_score AS FLOAT64) AS points_final_score
+            FROM source
+
+            UNION ALL
+
+            /* --- 2. POTP PERFORMANCE BLOCK --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year,
+                report_month,
+                role,
+                SAFE_CAST(director_wdid AS STRING),
+                director_name,
+                region,
+                NULL, NULL, NULL, NULL, NULL, NULL,
+                potp_kpi,
+                potp_business_category,
+                SAFE_CAST(potp_target AS FLOAT64),
+                SAFE_CAST(potp_ptg AS FLOAT64),
+                SAFE_CAST(potp_points_obtained AS FLOAT64),
+                SAFE_CAST(potp_weight AS FLOAT64),
+                SAFE_CAST(potp_weight_obtained AS FLOAT64),
+                CAST(potp_achievement_tier AS STRING),
+                SAFE_CAST(potp_points_for_final_score AS FLOAT64)
+            FROM source
+
+            UNION ALL
+
+            /* --- 3. YETG PERFORMANCE BLOCK (YEARLY EVALUATIONS - JUNE ONLY RULE) --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year,
+                report_month,
+                role,
+                SAFE_CAST(director_wdid AS STRING),
+                director_name,
+                region,
+                NULL, NULL, NULL, NULL, NULL, NULL,
+                yearly_evals_kpi,
+                yearly_evals_business_category,
+                -- Target restricted strictly to June
+                CASE 
+                WHEN yearly_evals_kpi = 'Yearly Evaluations (% to goal)' 
+                        AND UPPER(CAST(report_month AS STRING)) NOT IN ('JUN', 'JUNE', 'JUNIO', '6', '06') THEN NULL
+                ELSE SAFE_CAST(yearly_evals_target_master AS FLOAT64)
+                END AS target,
+                SAFE_CAST(yearly_evals_ptg AS FLOAT64),
+                SAFE_CAST(yearly_evals_metric_points AS FLOAT64),
+                -- Weight Master restricted strictly to June
+                CASE 
+                WHEN yearly_evals_kpi = 'Yearly Evaluations (% to goal)' 
+                        AND UPPER(CAST(report_month AS STRING)) NOT IN ('JUN', 'JUNE', 'JUNIO', '6', '06') THEN NULL
+                ELSE SAFE_CAST(yearly_evals_weight_master AS FLOAT64)
+                END,
+                SAFE_CAST(yearly_evals_weight_earned AS FLOAT64),
+                CAST(yearly_evals_achievement_category AS STRING),
+                SAFE_CAST(yearly_evals_points_final_score AS FLOAT64)
+            FROM source
+
+            UNION ALL
+
+            /* --- 4. COACHING / TEAM DEVELOPMENT BLOCK --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year,
+                report_month,
+                role,
+                SAFE_CAST(director_wdid AS STRING),
+                director_name,
+                region,
+                NULL, NULL, NULL, NULL, NULL, NULL,
+                coaching_kpi,
+                coaching_business_category,
+                SAFE_CAST(coaching_target_master AS FLOAT64),
+                SAFE_CAST(coaching_ptg AS FLOAT64),
+                SAFE_CAST(coaching_points_obtained AS FLOAT64),
+                SAFE_CAST(coaching_weight_master AS FLOAT64),
+                SAFE_CAST(coaching_weight_earned AS FLOAT64),
+                CAST(coaching_achievement_category AS STRING),
+                SAFE_CAST(coaching_points_final_score AS FLOAT64)
+            FROM source
+
+            UNION ALL
+
+            /* --- 5. FINAL SCORE BLOCK (DAPT INTEGRATION) --- */
+            SELECT 
+                PARSE_DATE('%b %E4Y', CONCAT(INITCAP(report_month), ' ', CAST(report_year AS STRING))),
+                report_year,
+                report_month,
+                role,
+                SAFE_CAST(director_wdid AS STRING),
+                director_name,
+                region,
+                NULL, NULL, NULL, NULL, NULL, NULL,
+                final_score_kpi,                  -- KPI: 'Final Score'
+                final_score_business_category,    -- Business Category: 'All'
+                CAST(NULL AS FLOAT64),            -- Target
+                SAFE_CAST(final_score_ptg AS FLOAT64), -- Overall achievement percentage ratio
+                CAST(NULL AS FLOAT64),            -- Metric Points
+                CAST(NULL AS FLOAT64),            -- Weight
+                CAST(NULL AS FLOAT64),            -- Weight Obtained
+                final_score_tier,                 -- Official performance tier classification
+                CASE 
+                  WHEN final_score_kpi = 'Final Score' AND TRIM(CAST(final_score_points_obtained AS STRING)) = '0' THEN NULL
+                  ELSE SAFE_CAST(final_score_points_obtained AS FLOAT64)
+                END AS points_final_score
+            FROM source
+        )
+
+    /* =========================================================================================
+       FINAL MASTER SELECTION & 3-LEVEL SECURITY COUPLING
+       Projects unpivoted dimensions under the unified 22-column master layout, defaulting null 
+       program fields to 'Global Operations'[cite: 23]. Couples 3-Level Row Level Security (RLS) 
+       using UNNEST array-string aggregation[cite: 23].
+    ========================================================================================= */
+    SELECT 
+        d.performance_date, 
+        d.report_year, 
+        d.report_month, 
+        d.position_role, 
+        d.employee_id, 
+        d.quality_team_member,
+        d.region, 
+        d.country, 
+        IFNULL(d.program, 'Global Operations') AS program, 
+        d.cost_center, 
+        d.immediate_supervisor, 
+        d.immediate_manager, 
+        d.immediate_sr_manager,
+        d.kpi, 
+        d.business_category, 
+        d.target, 
+        d.target_obtained, 
+        d.metric_points, 
+        d.weight, 
+        d.weight_obtained, 
+        d.tier,
+        d.points_final_score,
+        
+        -- FIRST LEVEL SECURITY: Evaluated Employee Email + Full Access System Emails
+        NULLIF(
+          ARRAY_TO_STRING(
+            ARRAY(
+              SELECT DISTINCT email
+              FROM UNNEST(
+                SPLIT(
+                  CONCAT(
+                    IFNULL(r.evaluated_email, ''),
+                    ',',
+                    IFNULL(fa.full_access_emails, '')
+                  ), ','
+                )
+              ) AS email
+              WHERE email IS NOT NULL AND TRIM(email) != ''
+            ), ','
+          ), ''
+        ) AS first_level_security,
+
+        -- SECOND LEVEL SECURITY: Immediate Supervisor 1 Email + Full Access System Emails
+        NULLIF(
+          ARRAY_TO_STRING(
+            ARRAY(
+              SELECT DISTINCT email
+              FROM UNNEST(
+                SPLIT(
+                  CONCAT(
+                    IFNULL(r.supervisor_1_email, ''),
+                    ',',
+                    IFNULL(fa.full_access_emails, '')
+                  ), ','
+                )
+              ) AS email
+              WHERE email IS NOT NULL AND TRIM(email) != ''
+            ), ','
+          ), ''
+        ) AS second_level_security,
+
+        -- THIRD LEVEL SECURITY: Evaluated Email + Full Hierarchy Chain (L1-L6) + Full Access System Emails
+        NULLIF(
+          ARRAY_TO_STRING(
+            ARRAY(
+              SELECT DISTINCT email
+              FROM UNNEST(
+                SPLIT(
+                  CONCAT(
+                    IFNULL(r.full_chain_emails, ''),
+                    ',',
+                    IFNULL(fa.full_access_emails, '')
+                  ), ','
+                )
+              ) AS email
+              WHERE email IS NOT NULL AND TRIM(email) != ''
+            ), ','
+          ), ''
+        ) AS third_level_security
+
+    FROM Unpivoted_Metrics d
+    CROSS JOIN full_access_list fa
+    LEFT JOIN roster_security r
+      ON REGEXP_REPLACE(TRIM(CAST(d.employee_id AS STRING)), r'\.0$', '') = r.employee_id_std
+     AND UPPER(TRIM(SUBSTR(CAST(d.report_month AS STRING), 1, 3))) = r.month_std
+     AND SAFE_CAST(d.report_year AS STRING) = r.year_std;
+
+END;
