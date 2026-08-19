@@ -1,0 +1,361 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_manager_vocpercenttogoalETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_manager_vocpercenttogoalETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'VOC % to Goal' KPI for CX Quality Managers 
+                and Senior Managers (15% Weight). The procedure employs a dual-branch structure to 
+                extract Workday IDs and names from raw hierarchical strings via regular expressions, 
+                averages granular VOC actuals and targets across active programs, applies 
+                multi-program capping to normalize performance outliers, maps scores to VOC-specific 
+                achievement tiers (<85%, <95%, <96%, >=96%), and calculates program-diluted 
+                scorecard weights.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_voc_ptg_manager_detailed` AS
+  
+  /* ==============================================================================================
+     BRANCH 1: CX QUALITY MANAGER ROLL-UP
+     ============================================================================================== */
+  
+  /* CTE 1.1: MANAGER BASE EXTRACTION
+     Extracts Manager Workday ID and clean Manager Name from concatenated string fields using 
+     regex parsing from the raw VOC dataset. */
+  WITH ManagerBase AS (
+    SELECT 
+      *,
+      REGEXP_EXTRACT(tl_manager, r'\((\d+)\)\s*$') AS wdid_manager,
+      TRIM(REGEXP_EXTRACT(tl_manager, r'^(.*?)\s*\(\d+\)\s*$')) AS manager_name
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_voc_raw`
+  ),
+
+  /* CTE 1.2: MANAGER FOOTPRINT TRACKING
+     Calculates the number of active, non-exempt operational footprint combinations (Program + 
+     Country + Region) managed by each Manager per month for downstream weight dilution. */
+  ProgramCounts AS (
+    SELECT 
+      CAST(wdid_manager AS STRING) AS wdid_manager, 
+      CAST(report_month AS STRING) AS report_month, 
+      CAST(report_year AS STRING) AS report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(kpi_applicable) = 'YES' AND UPPER(exempt) = 'NO' THEN CONCAT(program, COALESCE(country, ''), COALESCE(region, '')) END) AS final_total_programs
+    FROM ManagerBase
+    GROUP BY 1, 2, 3
+  ),
+
+  /* CTE 1.3: MANAGER METRIC AGGREGATION
+     Averages raw VOC actuals and targets up to the Manager hierarchy level. Consolidates 
+     applicability flags and allocates the 15% metric weight for active, non-exempt programs. */
+  CalculatedData AS (
+    SELECT 
+      'CX Quality Manager and Sr Manager' AS role,
+      MAX(raw.timestamp) AS timestamp,
+      CAST(raw.report_month AS STRING) AS report_month,
+      CAST(raw.report_year AS STRING) AS report_year,
+      raw.manager_name,
+      CAST(raw.wdid_manager AS STRING) AS wdid_manager,
+      raw.tl_sr_manager,
+      raw.program,
+      raw.country,
+      raw.region,
+      'My Customer' AS voc_business_category,
+      'VOC % to Goal' AS voc_kpi,
+      
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS voc_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0, 'No', 'Yes') AS voc_exempt,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0, 'Rolled up by Manager and Program', 'Exempt') AS voc_reason,
+      
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') = 0 OR COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64) ELSE NULL END))) AS voc_score_actual,
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') = 0 OR COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64) ELSE NULL END))) AS voc_score_target_program,
+      
+      pc.final_total_programs,
+      
+      CASE 
+        WHEN COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') > 0 AND COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0 THEN 0.15 
+        ELSE NULL 
+      END AS voc_weight,
+
+      SAFE_DIVIDE(
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+      ) AS voc_single_multi_program,
+
+      CASE WHEN pc.final_total_programs = 1 THEN
+        SAFE_DIVIDE(
+          AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+          AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+        )
+      ELSE NULL END AS voc_single_program,
+
+      SAFE_DIVIDE(
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+      ) AS _raw_calc
+    FROM ManagerBase AS raw
+    LEFT JOIN ProgramCounts AS pc 
+      ON CAST(raw.wdid_manager AS STRING) = pc.wdid_manager 
+      AND CAST(raw.report_month AS STRING) = pc.report_month 
+      AND CAST(raw.report_year AS STRING) = pc.report_year
+    GROUP BY 3,4,5,6,7,8,9,10, pc.final_total_programs
+  ),
+
+  /* CTE 1.4: MANAGER MULTI-PROGRAM CAPPING LOGIC
+     Normalizes performance outliers for Managers supporting multiple active programs by applying 
+     a continuous range capping matrix with VOC-specific bounds. */
+  CappedData AS (
+    SELECT * EXCEPT(_raw_calc),
+      IF(voc_exempt = 'Yes', NULL,
+        CASE WHEN final_total_programs >= 2 THEN
+            CASE 
+              WHEN _raw_calc <= 0.50 THEN 0
+              WHEN _raw_calc <= 0.85 THEN 0.50
+              WHEN _raw_calc < 0.96  THEN 0.75
+              WHEN _raw_calc < 1.15  THEN 1.00
+              WHEN _raw_calc >= 1.15 THEN 1.15
+              ELSE _raw_calc
+            END
+        ELSE NULL END) AS voc_multi_program,
+      IF(voc_exempt = 'Yes', NULL,
+        COALESCE(voc_single_program, 
+                 CASE WHEN final_total_programs >= 2 THEN
+                   CASE 
+                     WHEN _raw_calc <= 0.50 THEN 0
+                     WHEN _raw_calc <= 0.85 THEN 0.50
+                     WHEN _raw_calc < 0.96  THEN 0.75
+                     WHEN _raw_calc < 1.15  THEN 1.00
+                     WHEN _raw_calc >= 1.15 THEN 1.15
+                     ELSE _raw_calc
+                   END
+                 ELSE NULL END)) AS voc_perf_vs_cap_uncapped
+    FROM CalculatedData
+  ),
+
+  /* CTE 1.5: MANAGER DILUTION, TIERING & POINT ALLOCATION
+     Calculates the program-adjusted score and maps it against continuous VOC performance 
+     thresholds (<85%, <95%, <96%, >=96%) to assign standard Achievement Tiers and Metric Points. */
+  CategorizedAndPointsData AS (
+    SELECT *,
+      IF(voc_exempt = 'Yes', NULL, voc_perf_vs_cap_uncapped * SAFE_DIVIDE(1.0, final_total_programs)) AS adjusted_score_based_on_cap,
+
+      IF(voc_exempt = 'Yes', NULL,
+        CASE 
+          WHEN voc_perf_vs_cap_uncapped < 0.85 THEN 'Improvement Required'
+          WHEN voc_perf_vs_cap_uncapped < 0.95 THEN 'Developing'
+          WHEN voc_perf_vs_cap_uncapped < 0.96 THEN 'Achieving'
+          WHEN voc_perf_vs_cap_uncapped >= 0.96 THEN 'Excelling'
+          ELSE NULL 
+        END) AS achievement_category,
+      IF(voc_exempt = 'Yes', NULL,
+        CASE 
+          WHEN voc_perf_vs_cap_uncapped < 0.85 THEN 1
+          WHEN voc_perf_vs_cap_uncapped < 0.95 THEN 2
+          WHEN voc_perf_vs_cap_uncapped < 0.96 THEN 3
+          WHEN voc_perf_vs_cap_uncapped >= 0.96 THEN 4
+          ELSE NULL 
+        END) AS voc_points_obtained
+    FROM CappedData
+  ),
+
+  /* CTE 1.6: MANAGER WEIGHT DISTRIBUTION
+     Finalizes the Manager layer by computing quartered weight fractions, final numerical point 
+     contributions, and program-diluted final points. */
+  ManagerFinalData AS (
+    SELECT 
+      *,
+      IF(voc_exempt = 'Yes', NULL, (voc_points_obtained * 0.25) * voc_weight) AS voc_weight_obtaiend,
+      IF(voc_exempt = 'Yes', NULL, voc_points_obtained * voc_weight) AS voc_points_obtained_for_final_score_only,
+      IF(voc_exempt = 'Yes', NULL,
+        (CASE 
+          WHEN achievement_category = 'Improvement Required' THEN voc_weight * 0.25
+          WHEN achievement_category = 'Developing' THEN voc_weight * 0.50
+          WHEN achievement_category = 'Achieving' THEN voc_weight * 0.75
+          WHEN achievement_category = 'Excelling' THEN voc_weight * 1.00
+          ELSE NULL 
+        END) * SAFE_DIVIDE(1.0, final_total_programs)) AS voc_weight_obtaiend_program_diluted,
+
+      IF(voc_exempt = 'Yes', NULL,
+        CASE 
+          WHEN final_total_programs = 1 THEN CAST(voc_points_obtained * voc_weight AS FLOAT64)
+          ELSE CAST(voc_points_obtained * SAFE_DIVIDE(voc_weight, final_total_programs) AS FLOAT64)
+        END
+      ) AS voc_points_obtained_for_final_score_only_program_diluted
+
+    FROM 
+      CategorizedAndPointsData
+  ),
+
+  /* ==============================================================================================
+     BRANCH 2: CX SENIOR MANAGER ROLL-UP
+     ============================================================================================== */
+
+  /* CTE 2.1: SR. MANAGER BASE EXTRACTION
+     Extracts Senior Manager Workday ID and clean Senior Manager Name from the raw hierarchy string. 
+     Filters exclusively for active Senior Manager records. */
+  SrManagerBase AS (
+    SELECT 
+      * EXCEPT(tl_sr_manager),
+      CAST(NULL AS STRING) AS tl_sr_manager,
+      REGEXP_EXTRACT(tl_sr_manager, r'\((\d+)\)\s*$') AS wdid_manager,
+      TRIM(REGEXP_EXTRACT(tl_sr_manager, r'^(.*?)\s*\(\d+\)\s*$')) AS manager_name
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_voc_raw`
+    WHERE tl_sr_manager IS NOT NULL AND TRIM(tl_sr_manager) != ''
+  ),
+
+  /* CTE 2.2: SR. MANAGER FOOTPRINT TRACKING
+     Calculates the total distinct active program footprint managed across the Senior Manager's organization. */
+  SrProgramCounts AS (
+    SELECT 
+      CAST(wdid_manager AS STRING) AS wdid_manager, 
+      CAST(report_month AS STRING) AS report_month, 
+      CAST(report_year AS STRING) AS report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(kpi_applicable) = 'YES' AND UPPER(exempt) = 'NO' THEN CONCAT(program, COALESCE(country, ''), COALESCE(region, '')) END) AS final_total_programs
+    FROM SrManagerBase
+    GROUP BY 1, 2, 3
+  ),
+
+  /* CTE 2.3: SR. MANAGER METRIC AGGREGATION
+     Averages raw VOC actuals and targets up to the Senior Manager hierarchy level. */
+  SrCalculatedData AS (
+    SELECT 
+      'CX Quality Manager and Sr Manager' AS role,
+      MAX(raw.timestamp) AS timestamp,
+      CAST(raw.report_month AS STRING) AS report_month,
+      CAST(raw.report_year AS STRING) AS report_year,
+      raw.manager_name,
+      CAST(raw.wdid_manager AS STRING) AS wdid_manager,
+      raw.tl_sr_manager,
+      raw.program,
+      raw.country,
+      raw.region,
+      'My Customer' AS voc_business_category,
+      'VOC % to Goal' AS voc_kpi,
+      
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS voc_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0, 'No', 'Yes') AS voc_exempt,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0, 'Rolled up by Senior Manager and Program', 'Exempt') AS voc_reason,
+      
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') = 0 OR COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64) ELSE NULL END))) AS voc_score_actual,
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') = 0 OR COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64) ELSE NULL END))) AS voc_score_target_program,
+      
+      pc.final_total_programs,
+      
+      CASE 
+        WHEN COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') > 0 AND COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0 THEN 0.15 
+        ELSE NULL 
+      END AS voc_weight,
+
+      SAFE_DIVIDE(
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+      ) AS voc_single_multi_program,
+
+      CASE WHEN pc.final_total_programs = 1 THEN
+        SAFE_DIVIDE(
+          AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+          AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+        )
+      ELSE NULL END AS voc_single_program,
+
+      SAFE_DIVIDE(
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+      ) AS _raw_calc
+    FROM SrManagerBase AS raw
+    LEFT JOIN SrProgramCounts AS pc 
+      ON CAST(raw.wdid_manager AS STRING) = pc.wdid_manager 
+      AND CAST(raw.report_month AS STRING) = pc.report_month 
+      AND CAST(raw.report_year AS STRING) = pc.report_year
+    GROUP BY 3,4,5,6,7,8,9,10, pc.final_total_programs
+  ),
+
+  /* CTE 2.4: SR. MANAGER MULTI-PROGRAM CAPPING LOGIC
+     Normalizes performance outliers across the Senior Manager's multi-program operations using 
+     VOC-specific capping bounds. */
+  SrCappedData AS (
+    SELECT * EXCEPT(_raw_calc),
+      IF(voc_exempt = 'Yes', NULL,
+        CASE WHEN final_total_programs >= 2 THEN
+            CASE 
+              WHEN _raw_calc <= 0.50 THEN 0
+              WHEN _raw_calc <= 0.85 THEN 0.50
+              WHEN _raw_calc < 0.96  THEN 0.75
+              WHEN _raw_calc < 1.15  THEN 1.00
+              WHEN _raw_calc >= 1.15 THEN 1.15
+              ELSE _raw_calc
+            END
+        ELSE NULL END) AS voc_multi_program,
+      IF(voc_exempt = 'Yes', NULL,
+        COALESCE(voc_single_program, 
+                 CASE WHEN final_total_programs >= 2 THEN
+                   CASE 
+                     WHEN _raw_calc <= 0.50 THEN 0
+                     WHEN _raw_calc <= 0.85 THEN 0.50
+                     WHEN _raw_calc < 0.96  THEN 0.75
+                     WHEN _raw_calc < 1.15  THEN 1.00
+                     WHEN _raw_calc >= 1.15 THEN 1.15
+                     ELSE _raw_calc
+                   END
+                 ELSE NULL END)) AS voc_perf_vs_cap_uncapped
+    FROM SrCalculatedData
+  ),
+
+  /* CTE 2.5: SR. MANAGER DILUTION, TIERING & POINT ALLOCATION
+     Maps Senior Manager adjusted scores to standard VOC performance tiers and metric points. */
+  SrCategorizedAndPointsData AS (
+    SELECT *,
+      IF(voc_exempt = 'Yes', NULL, voc_perf_vs_cap_uncapped * SAFE_DIVIDE(1.0, final_total_programs)) AS adjusted_score_based_on_cap,
+
+      IF(voc_exempt = 'Yes', NULL,
+        CASE 
+          WHEN voc_perf_vs_cap_uncapped < 0.85 THEN 'Improvement Required'
+          WHEN voc_perf_vs_cap_uncapped < 0.95 THEN 'Developing'
+          WHEN voc_perf_vs_cap_uncapped < 0.96 THEN 'Achieving'
+          WHEN voc_perf_vs_cap_uncapped >= 0.96 THEN 'Excelling'
+          ELSE NULL 
+        END) AS achievement_category,
+      IF(voc_exempt = 'Yes', NULL,
+        CASE 
+          WHEN voc_perf_vs_cap_uncapped < 0.85 THEN 1
+          WHEN voc_perf_vs_cap_uncapped < 0.95 THEN 2
+          WHEN voc_perf_vs_cap_uncapped < 0.96 THEN 3
+          WHEN voc_perf_vs_cap_uncapped >= 0.96 THEN 4
+          ELSE NULL 
+        END) AS voc_points_obtained
+    FROM SrCappedData
+  ),
+
+  /* CTE 2.6: SR. MANAGER WEIGHT DISTRIBUTION
+     Finalizes Senior Manager layer calculations and weight dilution. */
+  SrManagerFinalData AS (
+    SELECT 
+      *,
+      IF(voc_exempt = 'Yes', NULL, (voc_points_obtained * 0.25) * voc_weight) AS voc_weight_obtaiend,
+      IF(voc_exempt = 'Yes', NULL, voc_points_obtained * voc_weight) AS voc_points_obtained_for_final_score_only,
+      IF(voc_exempt = 'Yes', NULL,
+        (CASE 
+          WHEN achievement_category = 'Improvement Required' THEN voc_weight * 0.25
+          WHEN achievement_category = 'Developing' THEN voc_weight * 0.50
+          WHEN achievement_category = 'Achieving' THEN voc_weight * 0.75
+          WHEN achievement_category = 'Excelling' THEN voc_weight * 1.00
+          ELSE NULL 
+        END) * SAFE_DIVIDE(1.0, final_total_programs)) AS voc_weight_obtaiend_program_diluted,
+
+      IF(voc_exempt = 'Yes', NULL,
+        CASE 
+          WHEN final_total_programs = 1 THEN CAST(voc_points_obtained * voc_weight AS FLOAT64)
+          ELSE CAST(voc_points_obtained * SAFE_DIVIDE(voc_weight, final_total_programs) AS FLOAT64)
+        END
+      ) AS voc_points_obtained_for_final_score_only_program_diluted
+
+    FROM 
+      SrCategorizedAndPointsData
+  )
+
+  /* ==============================================================================================
+     FINAL MASTER UNION
+     Combines Manager and Senior Manager rolled-up VOC datasets into a single unified table output.
+     ============================================================================================== */
+  SELECT * FROM ManagerFinalData
+  UNION ALL
+  SELECT * FROM SrManagerFinalData;
+
+END;
