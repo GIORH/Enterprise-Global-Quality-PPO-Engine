@@ -1,0 +1,227 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_analyst_vocpercenttogoal_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_analyst_vocpercenttogoal_ETL
+   DESCRIPTION: Master ETL pipeline for the 'VOC % to Goal' KPI for CX Quality Analysts.
+                This procedure dynamically adapts calculations based on the number of programs 
+                an analyst supports. It applies a customized capping logic for multi-program 
+                scenarios to normalize performance outliers, maps the results to a continuous 
+                VOC-specific tier scale, and calculates diluted metric weights (15% base) 
+                to ensure a proportionally balanced scorecard.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_voc_ptg_quality_analyst_detailed` AS
+  
+  /* =========================================================================================
+     CTE 1: PROGRAM APPLICABILITY COUNT
+     Determines the exact number of active programs assigned to each analyst per month where 
+     this specific KPI is applicable and non-exempt. This count triggers either standard or 
+     multi-program capping logic downstream.
+  ========================================================================================= */
+  WITH ProgramCounts AS (
+    SELECT 
+      tm_wdid, 
+      report_month, 
+      report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(kpi_applicable) = 'YES' AND UPPER(exempt) = 'NO' THEN program END) AS final_total_programs
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qa_voc_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  /* =========================================================================================
+     CTE 2: BASE DATA AND INITIAL RATIO CALCULATION
+     Extracts standard dimensions and calculates the baseline Percentage to Goal (Actual / Target).
+     Assigns the 15% master weight, isolates single-program performance, and retains the 
+     unaltered raw ratio to fuel the multi-program capping engine.
+  ========================================================================================= */
+  CalculatedData AS (
+    SELECT 
+      'CX Quality Analyst' AS role,
+      raw.timestamp, 
+      raw.submitter_email,
+      raw.report_month,
+      raw.report_year,
+      raw.tl_wdid,
+      raw.tl_name,
+      raw.tl_manager,
+      raw.tl_sr_manager,
+      raw.tm_wdid,
+      raw.tm_name,
+      raw.program,
+      raw.country,
+      raw.region,
+      'My Customer' AS voc_business_category,
+      'VOC % to Goal' AS voc_kpi,
+      raw.notes AS voc_notes,
+      raw.kpi_applicable AS voc_kpi_applicable,
+      raw.exempt AS voc_exempt,
+      raw.reason AS voc_reason,
+      
+      raw.voc_score_actual,
+      CASE 
+        WHEN UPPER(raw.kpi_applicable) = 'YES' AND UPPER(raw.exempt) = 'NO' THEN raw.voc_score_target_program 
+        ELSE NULL 
+      END AS voc_score_target_program,
+      pc.final_total_programs,
+      
+      -- Default metric weight allocation (15%)
+      CASE 
+        WHEN UPPER(raw.kpi_applicable) = 'YES' AND UPPER(raw.exempt) = 'NO' THEN 0.15 
+        ELSE NULL 
+      END AS voc_weight,
+
+      -- Standardized Percentage to Goal ratio
+      SAFE_DIVIDE(
+        CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64), 
+        CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64)
+      ) AS voc_single_multi_program,
+
+      -- Isolates the ratio strictly for analysts supporting a single program
+      CASE 
+        WHEN pc.final_total_programs = 1 THEN
+          NULLIF(
+            SAFE_DIVIDE(
+              CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64), 
+              CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64)
+            ), 
+            0
+          )
+        ELSE NULL 
+      END AS voc_single_program,
+      
+      -- Preserves the unaltered ratio to be processed by the capping logic
+      NULLIF(
+        SAFE_DIVIDE(
+          CAST(REPLACE(raw.voc_score_actual, '%', '') AS FLOAT64), 
+          CAST(REPLACE(raw.voc_score_target_program, '%', '') AS FLOAT64)
+        ), 
+        0
+      ) AS _raw_calc
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qa_voc_raw` AS raw
+    LEFT JOIN 
+      ProgramCounts AS pc 
+      ON raw.tm_wdid = pc.tm_wdid 
+      AND raw.report_month = pc.report_month 
+      AND raw.report_year = pc.report_year
+  ),
+
+  /* =========================================================================================
+     CTE 3: MULTI-PROGRAM CAPPING LOGIC
+     Normalizes performance outliers for analysts supporting multiple programs. Applies a 
+     continuous range logic (using VOC-specific upper/lower limits) to group raw scores 
+     into predefined capped tiers, preventing evaluation gaps.
+  ========================================================================================= */
+  CappedData AS (
+    SELECT 
+      * EXCEPT(_raw_calc),
+      
+      -- Applies stepped capping logic strictly to multi-program analysts
+      CASE 
+        WHEN final_total_programs >= 2 THEN
+          CASE 
+            WHEN _raw_calc <= 0.5000 THEN 0
+            WHEN _raw_calc <= 0.8500 THEN 0.50
+            WHEN _raw_calc < 0.9600  THEN 0.75
+            WHEN _raw_calc < 1.1500  THEN 1.00
+            WHEN _raw_calc >= 1.1500 THEN 1.1500
+            ELSE _raw_calc
+          END
+        ELSE NULL 
+      END AS voc_multi_program,
+      
+      -- Master evaluation column: merges single-program scores with capped multi-program scores
+      COALESCE(
+        voc_single_program, 
+        CASE 
+          WHEN final_total_programs >= 2 THEN
+            CASE 
+              WHEN _raw_calc <= 0.5000 THEN 0
+              WHEN _raw_calc <= 0.8500 THEN 0.50
+              WHEN _raw_calc < 0.9600  THEN 0.75
+              WHEN _raw_calc < 1.1500  THEN 1.00
+              WHEN _raw_calc >= 1.1500 THEN 1.1500
+              ELSE _raw_calc
+            END
+          ELSE NULL 
+        END
+      ) AS voc_perf_vs_cap_uncapped
+    FROM 
+      CalculatedData
+  ),
+
+  /* =========================================================================================
+     CTE 4: DILUTION, TIERING & POINT ASSIGNMENT
+     Calculates the program-adjusted score and maps it against the continuous VOC-specific 
+     performance thresholds (85/95/96) to assign the final Achievement Category and 
+     standardized Metric Points (1-4).
+  ========================================================================================= */
+  CategorizedAndPointsData AS (
+    SELECT
+      *,
+      -- Dilutes the capped score evenly across the analyst's total active programs
+      voc_perf_vs_cap_uncapped * SAFE_DIVIDE(1.0, final_total_programs) AS adjusted_score_based_on_cap,
+
+      -- Continuous tier mapping utilizing VOC-specific business rules
+      CASE 
+        WHEN voc_perf_vs_cap_uncapped < 0.85 THEN 'Improvement Required'
+        WHEN voc_perf_vs_cap_uncapped < 0.95 THEN 'Developing'
+        WHEN voc_perf_vs_cap_uncapped < 0.96 THEN 'Achieving'
+        WHEN voc_perf_vs_cap_uncapped >= 0.96 THEN 'Excelling'
+        ELSE NULL 
+      END AS achievement_category,
+      
+      -- Standardized 4-point scale assignment based on performance tier
+      CASE 
+        WHEN voc_perf_vs_cap_uncapped < 0.85 THEN 1
+        WHEN voc_perf_vs_cap_uncapped < 0.95 THEN 2
+        WHEN voc_perf_vs_cap_uncapped < 0.96 THEN 3
+        WHEN voc_perf_vs_cap_uncapped >= 0.96 THEN 4
+        ELSE NULL 
+      END AS voc_points_obtained
+    FROM 
+      CappedData
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: WEIGHT DISTRIBUTION & SCORING
+     Computes the definitive scorecard impacts. Distributes the 15% weight according to the 
+     points obtained and applies program dilution to the final points to ensure multi-program 
+     analysts accurately aggregate to the intended maximum score.
+  ========================================================================================= */
+  SELECT 
+    *,
+    
+    -- Translates tier points into quartered weight distributions
+    CASE 
+      WHEN achievement_category = 'Improvement Required' THEN voc_weight * 0.25
+      WHEN achievement_category = 'Developing' THEN voc_weight * 0.50
+      WHEN achievement_category = 'Achieving' THEN voc_weight * 0.75
+      WHEN achievement_category = 'Excelling' THEN voc_weight * 1.00
+      ELSE NULL 
+    END AS voc_weight_obtaiend,
+
+    -- Dilutes the earned weight evenly across the total active programs
+    (CASE 
+      WHEN achievement_category = 'Improvement Required' THEN voc_weight * 0.25
+      WHEN achievement_category = 'Developing' THEN voc_weight * 0.50
+      WHEN achievement_category = 'Achieving' THEN voc_weight * 0.75
+      WHEN achievement_category = 'Excelling' THEN voc_weight * 1.00
+      ELSE NULL 
+    END) * SAFE_DIVIDE(1.0, final_total_programs) AS voc_weight_obtaiend_program_diluted,
+  
+    -- Final calculation for global score generation
+    voc_points_obtained * voc_weight AS voc_points_obtained_for_final_score_only,
+
+    -- Program-diluted final points generation for proportional scorecard aggregation
+    CASE 
+      WHEN final_total_programs = 1 THEN CAST(voc_points_obtained * voc_weight AS FLOAT64)
+      ELSE CAST(voc_points_obtained * SAFE_DIVIDE(voc_weight, final_total_programs) AS FLOAT64)
+    END AS voc_points_obtained_for_final_score_only_program_diluted
+
+  FROM 
+    CategorizedAndPointsData;
+
+END;
