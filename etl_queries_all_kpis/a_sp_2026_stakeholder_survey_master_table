@@ -1,0 +1,120 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.a_sp_2026_stakeholder_survey_master_table`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: a_sp_2026_stakeholder_survey_master_table
+   DESCRIPTION: Consolidates and aggregates Stakeholder Survey responses at the regional level.
+                Filters for active survey responses, standardizes temporal dimensions, and computes 
+                the aggregate Stakeholder Rating (Total Score / Total Count). Calculates the 
+                Percentage to Goal (PTG) to assign standardized performance tiers and metric points 
+                for scorecard integration.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_stakeholder_survey_master_table` AS
+  
+  /* =========================================================================================
+     CTE 1: BASE DATA EXTRACTION & STANDARDIZATION
+     Extracts survey data, standardizes date dimensions, and aggregates individual survey 
+     categories into intermediate total scores and counts per program/country. Filters 
+     exclusively for records with active responses.
+  ========================================================================================= */
+  WITH Calculos_Base AS (
+    SELECT 
+      REGEXP_REPLACE(TRIM(CAST(Year AS STRING)), r'\.0$', '') AS report_year,
+      UPPER(TRIM(SUBSTR(CAST(Survey_Date AS STRING), 1, 3))) AS report_month,
+      PARSE_DATE('%B %Y', Survey_Date) AS performance_date,
+      TRIM(Region) AS region,
+      
+      -- Aggregates raw score components across all evaluation dimensions
+      NULLIF((
+        IFNULL(SAFE_CAST(Scope_scr AS FLOAT64), 0) + IFNULL(SAFE_CAST(Alignment_scr AS FLOAT64), 0) + 
+        IFNULL(SAFE_CAST(Support_scr AS FLOAT64), 0) + IFNULL(SAFE_CAST(Execution_scr AS FLOAT64), 0) + 
+        IFNULL(SAFE_CAST(Strategic_scr AS FLOAT64), 0) + IFNULL(SAFE_CAST(Communication_scr AS FLOAT64), 0) + 
+        IFNULL(SAFE_CAST(Culture_scr AS FLOAT64), 0)
+      ), 0) AS total_score_scr,
+
+      -- Aggregates raw count components across all evaluation dimensions
+      NULLIF((
+        IFNULL(SAFE_CAST(Scope_count AS FLOAT64), 0) + IFNULL(SAFE_CAST(Alignment_count AS FLOAT64), 0) + 
+        IFNULL(SAFE_CAST(Support_count AS FLOAT64), 0) + IFNULL(SAFE_CAST(Execution_count AS FLOAT64), 0) + 
+        IFNULL(SAFE_CAST(Strategic_count AS FLOAT64), 0) + IFNULL(SAFE_CAST(Communication_count AS FLOAT64), 0) + 
+        IFNULL(SAFE_CAST(Culture_count AS FLOAT64), 0)
+      ), 0) AS total_count
+
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_stakeholder_survey_raw`
+    WHERE Survey_Date IS NOT NULL
+      -- Ensures only active responses are processed into the operational dataset
+      AND IFNULL(SAFE_CAST(prgrmNcntry_resp AS INT64), 0) > 0  
+  ),
+
+  /* =========================================================================================
+     CTE 2: REGIONAL AGGREGATION & METRIC CALCULATION
+     Rolls up the programmatic data to the regional level per month and year. Computes the 
+     overall stakeholder rating and normalizes it into a Percentage to Goal (PTG) metric.
+  ========================================================================================= */
+  Rolled_Up_Base AS (
+    SELECT
+      report_year,
+      report_month,
+      MIN(performance_date) AS performance_date,
+      region,
+      CAST('Stakeholder Surveys' AS STRING) AS kpi_name,
+      CAST('My Team' AS STRING) AS business_category,
+      0.85 AS actual_target,
+      SUM(total_score_scr) AS total_score_scr,
+      SUM(total_count) AS total_count,
+      
+      -- Stakeholder Rating: Weighted average of total scores over total responses
+      SAFE_DIVIDE(SUM(total_score_scr), SUM(total_count)) AS stakeholder_rating,
+
+      -- Percentage to Goal (PTG): Normalizes the rating against a 4-point maximum scale
+      SAFE_DIVIDE(SAFE_DIVIDE(SUM(total_score_scr), SUM(total_count)), 4) AS stakeholder_survey_ptg,
+      
+      CAST(NULL AS FLOAT64) AS metric_weight,
+      CAST(NULL AS FLOAT64) AS weight_obtained
+    FROM Calculos_Base
+    GROUP BY 1, 2, 4, 5, 6, 7
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: TIER ASSIGNMENT & SCORECARD MAPPING
+     Evaluates the regional Stakeholder PTG against business thresholds to assign the 
+     standardized Achievement Tier and continuous Metric Points (1-4 scale).
+  ========================================================================================= */
+  SELECT
+    report_year,
+    report_month,
+    performance_date,
+    region,
+    kpi_name,
+    business_category,
+    actual_target,
+    total_score_scr,
+    total_count,
+    stakeholder_rating,
+    stakeholder_survey_ptg,
+    metric_weight,
+    weight_obtained,
+    
+    -- Evaluates the PTG against standardized tier thresholds
+    CASE 
+      WHEN stakeholder_survey_ptg IS NULL THEN NULL
+      WHEN stakeholder_survey_ptg < 0.75 THEN 'Improvement Required'
+      WHEN stakeholder_survey_ptg < 0.85 THEN 'Developing'
+      WHEN stakeholder_survey_ptg < 0.86 THEN 'Achieving'
+      ELSE 'Excelling'
+    END AS sths_achievement_category,
+    
+    -- Maps the evaluated tier to mathematical points for scorecard weighting
+    CASE 
+      WHEN stakeholder_survey_ptg IS NULL THEN NULL
+      WHEN stakeholder_survey_ptg < 0.75 THEN 1
+      WHEN stakeholder_survey_ptg < 0.85 THEN 2
+      WHEN stakeholder_survey_ptg < 0.86 THEN 3
+      ELSE 4
+    END AS sths_points_obtained,
+
+    CAST(NULL AS FLOAT64) AS sths_points_final_score
+
+  FROM Rolled_Up_Base;
+END;
