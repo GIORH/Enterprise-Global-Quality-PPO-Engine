@@ -1,0 +1,246 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_manager_non_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step1_sp_2026_scorecard_manager_non_rolled_up_consolidated
+   DESCRIPTION: Master consolidation procedure for Manager non-rolled-up metrics (Innovation 
+                and Professional Personal Development - PPD). Consolidates metrics into a single 
+                record per Manager, Month, and Year. Applies hardcoded metric weights (10%) and 
+                targets (100%). Maps Innovation impact points and PPD completion ratios to 
+                standardized achievement tiers while simultaneously computing windowed Year-to-Date 
+                (YTD) cumulative progressions.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_manager_non_rolled_up_consolidated` AS
+  
+  /* ===========================================================================
+     BLOCK 1: DIMENSIONAL SKELETON (MANAGER LEVEL)
+     Unions unique Manager identifiers across Innovation and PPD raw source datasets. 
+     Parses string dates into standard BigQuery DATE types to establish ordering for YTD calculations.
+  =========================================================================== */
+  WITH mngr_skeleton AS (
+    SELECT 
+      CAST(mngr_wdid AS INT64) as manager_wdid, 
+      LOWER(TRIM(report_month)) as report_month, 
+      CAST(report_year AS INT64) as report_year,
+      ANY_VALUE(SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(TRIM(report_month), 1, 3)), ' ', CAST(report_year AS STRING)))) AS parsed_date,
+      ANY_VALUE(TRIM(mngr_name)) as manager_name, 
+      ANY_VALUE(TRIM(country)) as country, 
+      ANY_VALUE(TRIM(region)) as region,
+      ANY_VALUE(TRIM(mngr_immediate_manager)) as manager_immediate_supervisor, 
+      ANY_VALUE(TRIM(mngr_sr_manager)) as manager_sr_manager
+    FROM (
+      SELECT mngr_wdid, report_month, report_year, mngr_name, country, region, mngr_immediate_manager, mngr_sr_manager 
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qamngr_innovation_raw` 
+      UNION ALL
+      SELECT mngr_wdid, report_month, report_year, mngr_name, country, region, mngr_immediate_manager, mngr_sr_manager 
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qamngr_ppd_raw`
+    )
+    GROUP BY 1, 2, 3
+  ),
+
+  /* ===========================================================================
+     BLOCK 2: INNOVATION AGGREGATION WITH EXEMPTION COLUMNS
+     Aggregates raw monthly counts for Innovation impacts (High, Medium, Low) at the Manager level.
+  =========================================================================== */
+  inn_block AS (
+    SELECT 
+      CAST(mngr_wdid AS INT64) as wdid, 
+      LOWER(TRIM(report_month)) as month, 
+      CAST(report_year AS INT64) as year,
+      'Yes' AS innovation_kpi_applicable,
+      'No' AS innovation_exempt,
+      CAST(NULL AS STRING) AS innovation_reason,
+      SUM(SAFE_CAST(innovation_high_count AS FLOAT64)) as high_count,
+      SUM(SAFE_CAST(innovation_med_count AS FLOAT64)) as med_count,
+      SUM(SAFE_CAST(innovation_low_count AS FLOAT64)) as low_count
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qamngr_innovation_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  /* ===========================================================================
+     BLOCK 3: PPD AGGREGATION WITH NATIVE EXEMPTION COLUMNS
+     Aggregates raw monthly counts for PPD completed and required courses at the Manager level, 
+     evaluating native exemption flags.
+  =========================================================================== */
+  ppd_block AS (
+    SELECT 
+      CAST(mngr_wdid AS INT64) as wdid, 
+      LOWER(TRIM(report_month)) as month, 
+      CAST(report_year AS INT64) as year,
+      'Yes' AS ppd_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(exempt)) = 'no') > 0, 'No', 'Yes') as ppd_exempt,
+      MAX(CASE WHEN LOWER(TRIM(exempt)) = 'yes' THEN exception_reason ELSE NULL END) as ppd_reason,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) != 'yes' THEN SAFE_CAST(ppd_completed_courses AS FLOAT64) ELSE 0 END) as actual_courses,
+      SUM(CASE WHEN LOWER(TRIM(exempt)) != 'yes' THEN SAFE_CAST(ppd_required_courses AS FLOAT64) ELSE 0 END) as required_courses
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qamngr_ppd_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  /* ===========================================================================
+     BLOCK 4: CONSOLIDATION & RAW CALCULATIONS
+     Joins Innovation and PPD aggregations with the Manager dimensional skeleton. Computes raw 
+     weighted Innovation points (High*4 + Medium*3 + Low*2) and raw PPD completion ratios. 
+     Injects strategic metric targets (100%) and weights (10%).
+  =========================================================================== */
+  assembly AS (
+    SELECT 
+      t.*,
+      -- Innovation Data
+      inn.innovation_kpi_applicable,
+      inn.innovation_exempt,
+      inn.innovation_reason,
+      inn.high_count, 
+      inn.med_count, 
+      inn.low_count,
+      IF(inn.innovation_exempt = 'Yes', NULL, 
+        CASE 
+          WHEN inn.high_count IS NULL AND inn.med_count IS NULL AND inn.low_count IS NULL THEN NULL 
+          ELSE (COALESCE(inn.high_count,0) * 4 + COALESCE(inn.med_count,0) * 3 + COALESCE(inn.low_count,0) * 2) 
+        END) as inn_total_metric_points,
+      
+      -- PPD Data
+      pp.ppd_kpi_applicable,
+      pp.ppd_exempt,
+      pp.ppd_reason,
+      pp.actual_courses, 
+      pp.required_courses,
+      IF(pp.ppd_exempt = 'Yes', NULL, SAFE_DIVIDE(pp.actual_courses, pp.required_courses)) as ppd_ptg_raw,
+
+      -- Hardcoded Targets & Weights (Strategic Definition)
+      1.0 as h_target,   -- 100% Target
+      0.10 as h_weight   -- 10% Weight
+  
+    FROM mngr_skeleton t
+    LEFT JOIN inn_block inn ON t.manager_wdid = inn.wdid AND t.report_month = inn.month AND t.report_year = inn.year
+    LEFT JOIN ppd_block pp ON t.manager_wdid = pp.wdid AND t.report_month = pp.month AND t.report_year = pp.year
+  ),
+
+  /* ===========================================================================
+     BLOCK 5: ACHIEVEMENT & PTG MAPPING
+     Calculates windowed Year-to-Date (YTD) running totals for Innovation impact points and PPD 
+     course volumes. Maps discrete monthly Innovation points into standardized PTG performance 
+     percentages and calculates PPD 4-point scale calculated points.
+  =========================================================================== */
+  logic_attribution AS (
+    SELECT 
+      *,
+      -- YTD Cumulative for Innovation Metric Points
+      SUM(IF(innovation_exempt = 'Yes', NULL, inn_total_metric_points)) OVER (PARTITION BY manager_wdid, report_year ORDER BY parsed_date) as innovation_metric_points_ytd,
+
+      -- YTD Cumulative for PPD Completed & Required
+      SUM(IF(ppd_exempt = 'Yes', NULL, actual_courses)) OVER (PARTITION BY manager_wdid, report_year ORDER BY parsed_date) as ppd_completed_courses_ytd,
+      SUM(IF(ppd_exempt = 'Yes', NULL, required_courses)) OVER (PARTITION BY manager_wdid, report_year ORDER BY parsed_date) as ppd_required_courses_ytd,
+
+      -- Innovation PTG Mapping protected against exemptions (monthly based)
+      IF(innovation_exempt = 'Yes', NULL,
+        CASE 
+          WHEN inn_total_metric_points IS NULL THEN NULL
+          WHEN inn_total_metric_points = 1 THEN 0.25
+          WHEN inn_total_metric_points = 2 THEN 0.50
+          WHEN inn_total_metric_points = 3 THEN 0.75
+          WHEN inn_total_metric_points = 4 THEN 1.00
+          WHEN inn_total_metric_points >= 5 THEN 1.001 
+          ELSE 0.0 
+        END) as inn_ptg_mapped,
+
+      -- Points Mapping for PPD protected against exemptions (monthly based)
+      IF(ppd_exempt = 'Yes', NULL,
+        CASE 
+          WHEN ppd_ptg_raw IS NULL THEN NULL
+          WHEN ppd_ptg_raw > 1.0   THEN 4
+          WHEN ppd_ptg_raw >= 0.91 THEN 3
+          WHEN ppd_ptg_raw >= 0.50 THEN 2
+          ELSE 1 
+        END) as pp_points_calculated
+    FROM assembly
+  )
+
+  /* ===========================================================================
+     BLOCK 6: FINAL SELECTION WITH INCORPORATED EXEMPTION FIELDS
+     Finalizes the Manager scorecard presentation layer. Constructs the primary key, maps 
+     mapped/raw PTG values to official Achievement Tiers and continuous 4-point scale metric 
+     points, and calculates earned weights and final scorecard point contributions.
+  =========================================================================== */
+  SELECT 
+    CONCAT(CAST(manager_wdid AS STRING), '_', report_month, '_', CAST(report_year AS STRING)) as primary_key,
+    manager_wdid, 
+    report_month, 
+    report_year, 
+    manager_name, 
+    manager_immediate_supervisor, 
+    manager_sr_manager, 
+    country, 
+    region,
+
+    -- --- INNOVATION SEGMENT ---
+    'My Business' as innovation_businesscategory,
+    'Innovation' as innovation_kpi,
+    innovation_kpi_applicable,
+    innovation_exempt,
+    innovation_reason,
+    high_count as innovation_high_count, 
+    med_count as innovation_med_count, 
+    low_count as innovation_low_count,
+    inn_total_metric_points as innovation_metric_points, 
+    IF(innovation_exempt = 'Yes', NULL, innovation_metric_points_ytd) as innovation_metric_points_ytd,
+    IF(innovation_kpi_applicable = 'No' OR innovation_exempt = 'Yes', NULL, h_target) as innovation_target,
+    IF(innovation_exempt = 'Yes', NULL, h_weight) as innovation_weight, 
+    inn_ptg_mapped as innovation_ptg,
+    -- Innovation Weight Obtained (With CAP at 10% and blank if exempt)
+    IF(innovation_exempt = 'Yes', NULL, (CASE WHEN inn_ptg_mapped > 1.00 THEN 4 WHEN inn_ptg_mapped = 1.00 THEN 3 WHEN inn_ptg_mapped >= 0.75 THEN 2 ELSE 1 END * 0.25) * h_weight) AS innovation_weight_obtained,
+    -- Achievement: <75% IR, 75-99.99% Dev, 100% Ach, >100% Exc
+    CASE 
+      WHEN innovation_exempt = 'Yes' THEN NULL
+      WHEN inn_ptg_mapped > 1.00  THEN 'Excelling'
+      WHEN inn_ptg_mapped = 1.00  THEN 'Achieving'
+      WHEN inn_ptg_mapped >= 0.75 THEN 'Developing'
+      ELSE 'Improvement Required' 
+    END as innovation_achievement,
+    -- Innovation Points scale
+    IF(innovation_exempt = 'Yes', NULL,
+      CASE 
+        WHEN inn_ptg_mapped > 1.00  THEN 4
+        WHEN inn_ptg_mapped = 1.00  THEN 3
+        WHEN inn_ptg_mapped >= 0.75 THEN 2
+        ELSE 1 
+      END) as innovation_points_obtained,
+    -- Weight * Points for Innovation
+    IF(innovation_exempt = 'Yes', NULL,
+      (CASE 
+        WHEN inn_ptg_mapped > 1.00  THEN 4
+        WHEN inn_ptg_mapped = 1.00  THEN 3
+        WHEN inn_ptg_mapped >= 0.75 THEN 2
+        ELSE 1 
+      END * h_weight)) as innovation_points_obtained_for_final_score_only,
+
+    -- --- PPD SEGMENT ---
+    'My Team' as ppd_businesscategory,
+    'PPD' as ppd_kpi,
+    ppd_kpi_applicable,
+    ppd_exempt,
+    ppd_reason,
+    actual_courses as ppd_completed_courses, 
+    IF(ppd_exempt = 'Yes', NULL, ppd_completed_courses_ytd) as ppd_completed_courses_ytd,
+    required_courses as ppd_required_courses,
+    IF(ppd_exempt = 'Yes', NULL, ppd_required_courses_ytd) as ppd_required_courses_ytd,
+    IF(ppd_kpi_applicable = 'No' OR ppd_exempt = 'Yes', NULL, h_target) as ppd_target,
+    ppd_ptg_raw as ppd_ptg,
+    IF(ppd_exempt = 'Yes', NULL, h_weight) as ppd_weight, 
+    -- PPD Weight Obtained (With CAP at 10% and blank if exempt)
+    IF(ppd_exempt = 'Yes', NULL, (pp_points_calculated * 0.25) * h_weight) AS ppd_weight_obtained,
+    -- Achievement: <50% IR, 50-90.99% Dev, 91-100% Ach, >100% Exc
+    CASE 
+      WHEN ppd_exempt = 'Yes' THEN NULL
+      WHEN ppd_ptg_raw > 1.0   THEN 'Excelling'
+      WHEN ppd_ptg_raw >= 0.91 THEN 'Achieving'
+      WHEN ppd_ptg_raw >= 0.50 THEN 'Developing'
+      ELSE 'Improvement Required' 
+    END as ppd_achievement_category,
+    IF(ppd_exempt = 'Yes', NULL, pp_points_calculated) as ppd_points_obtained,
+    -- Weight * Points for PPD (Standardized Name)
+    IF(ppd_exempt = 'Yes', NULL, (pp_points_calculated * h_weight)) as ppd_points_obtained_for_final_score_only
+
+  FROM logic_attribution;
+
+END;
