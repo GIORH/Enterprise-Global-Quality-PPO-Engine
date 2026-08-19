@@ -1,0 +1,155 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_productivity_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_lead_productivity_ETL
+   DESCRIPTION: Master ETL pipeline for the 'Productivity' KPI for CX Quality Team Leads.
+                This procedure aggregates raw audit completion data, calculates the Percentage 
+                to Goal (PTG), and evaluates performance against a customized 3-tier scale 
+                (1 to 3 points). It also dynamically calculates the applicable program footprint 
+                to ensure the 10% metric weight is properly diluted across all active programs.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_productivity_team_lead_detailed` AS
+
+  /* =========================================================================================
+     CTE 1: HIERARCHICAL FOOTPRINT TRACKING
+     Determines the exact number of active, non-exempt operational combinations (Program + 
+     Country + Region) managed by each Team Lead. This distinct count is crucial for accurate 
+     downstream weight dilution across multi-program assignments.
+  ========================================================================================= */
+  WITH ProgramCounts AS (
+    SELECT 
+      CAST(tl_wdid AS STRING) as tl_wdid, 
+      CAST(report_month AS STRING) as report_month, 
+      CAST(report_year AS STRING) as report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(TRIM(exempt)) = 'NO' THEN CONCAT(program, COALESCE(country, ''), COALESCE(region, '')) END) AS final_total_programs
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qatl_productivity_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  /* =========================================================================================
+     CTE 2: BASE DATA AND RATIO CALCULATION
+     Extracts standard dimensions and raw audit volumes. Injects scorecard metadata (10% weight, 
+     1.00 master target) and calculates the core Productivity Percentage to Goal safely, 
+     accounting for data formatting and exemption rules.
+  ========================================================================================= */
+  Base_Calculations AS (
+    SELECT 
+      -- Standard dimensions and identifiers
+      raw.pk,
+      raw.timestamp,
+      raw.submitter_email,
+      CAST(raw.report_month AS STRING) as report_month,
+      CAST(raw.report_year AS STRING) as report_year,
+      CAST(raw.tl_wdid AS STRING) as tl_wdid,
+      raw.tl_name,
+      raw.tl_manager,
+      raw.tl_sr_manager,
+      raw.program,
+      raw.country,
+      raw.region,
+      
+      -- Base quantitative metrics
+      raw.audits_completed,
+      raw.audits_required,
+      raw.exempt,
+      raw.exemption_reason,
+      raw.notes,
+
+      -- Standardized multi-program count
+      pc.final_total_programs,
+
+      -- Static scorecard metadata configuration
+      'My Business' AS productivity_business_category,
+      'Productivity' AS productivity_kpi,
+      IF(LOWER(TRIM(raw.exempt)) = 'yes', NULL, 1.00) AS productivity_target, 
+      
+      -- Audit and applicability control flags
+      'Yes' AS productivity_kpi_applicable,
+      IF(LOWER(TRIM(raw.exempt)) = 'yes', 'Yes', 'No') AS productivity_exempt,
+      IF(LOWER(TRIM(raw.exempt)) = 'yes', raw.exemption_reason, NULL) AS productivity_reason,
+
+      -- Dynamic metric weight allocation (10%)
+      IF(LOWER(TRIM(raw.exempt)) = 'yes', NULL, 0.10) AS productivity_weight,
+
+      -- Safe calculation of the Productivity Percentage to Goal
+      IF(LOWER(TRIM(raw.exempt)) = 'yes', NULL, 
+        SAFE_DIVIDE(
+          CAST(REPLACE(CAST(raw.audits_completed AS STRING), ',', '') AS FLOAT64), 
+          CAST(REPLACE(CAST(raw.audits_required AS STRING), ',', '') AS FLOAT64)
+        )
+      ) AS productivity_pct
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qatl_productivity_raw` AS raw
+    LEFT JOIN ProgramCounts AS pc
+      ON CAST(raw.tl_wdid AS STRING) = pc.tl_wdid
+      AND CAST(raw.report_month AS STRING) = pc.report_month
+      AND CAST(raw.report_year AS STRING) = pc.report_year
+  ),
+
+  /* =========================================================================================
+     CTE 3: METRIC TIERING & POINT ALLOCATION
+     Maps the computed productivity percentage against a specialized 3-tier performance scale 
+     to determine the standardized metric points (1 to 3) and Achievement Category.
+  ========================================================================================= */
+  Categorization AS (
+    SELECT 
+      *,
+      -- Continuous 3-tier performance evaluation mapping
+      CASE 
+        WHEN productivity_exempt = 'Yes' THEN NULL
+        WHEN productivity_pct < 0.90 THEN 'Improvement Required'
+        WHEN productivity_pct < 1.00 THEN 'Developing'
+        WHEN productivity_pct >= 1.00 THEN 'Achieving'
+        ELSE 'N/A'
+      END AS productivity_achievement_category,
+
+      -- Point allocation aligned with the 3-tier scale
+      CASE 
+        WHEN productivity_exempt = 'Yes' THEN NULL
+        WHEN productivity_pct < 0.90 THEN 1
+        WHEN productivity_pct < 1.00 THEN 2
+        WHEN productivity_pct >= 1.00 THEN 3
+        ELSE 0
+      END AS productivity_points
+    FROM 
+      Base_Calculations
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: WEIGHT DISTRIBUTION & SCORING
+     Computes the definitive scorecard impacts. Distributes the earned weight using a 
+     third-based fractional scale (33.3%, 66.6%, 100%) based on the 3-tier points, and applies 
+     program dilution to the final outputs.
+  ========================================================================================= */
+  SELECT 
+    *,
+    -- Calculates earned weight using a 3-tier fractional distribution (33.3%, 66.6%, 100%)
+    IF(productivity_exempt = 'Yes', NULL,
+      (CASE 
+        WHEN productivity_points = 1 THEN 0.3333
+        WHEN productivity_points = 2 THEN 0.6666
+        WHEN productivity_points = 3 THEN 1.0000
+        ELSE 0 
+      END) * productivity_weight) AS productivity_weight_obtained,
+
+    -- Calculates the final numerical points contribution for global scoring
+    IF(productivity_exempt = 'Yes', NULL, productivity_points * productivity_weight) AS productivity_weight_final_score,
+
+    -- Proportional weight dilution across the active program footprint
+    IF(productivity_exempt = 'Yes', NULL,
+      ((CASE 
+        WHEN productivity_points = 1 THEN 0.3333
+        WHEN productivity_points = 2 THEN 0.6666
+        WHEN productivity_points = 3 THEN 1.0000
+        ELSE 0 
+      END) * productivity_weight) * SAFE_DIVIDE(1.0, final_total_programs)) AS productivity_weight_diluted
+
+  FROM 
+    Categorization;
+
+  -- Execution success status indicator (SQL Literal preserved)
+  SELECT 'Roster updated: Productivity TL block with 3-bucket logic, 10% weight and program counts.' as status;
+
+END;
