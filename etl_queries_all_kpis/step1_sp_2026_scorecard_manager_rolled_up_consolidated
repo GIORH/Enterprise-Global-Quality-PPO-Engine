@@ -1,0 +1,183 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_manager_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step1_sp_2026_scorecard_manager_rolled_up_consolidated
+   DESCRIPTION: Master consolidation procedure for the rolled-up CX Quality Manager Scorecard. 
+                Unifies operational dimensions across three detailed metric ETL pipelines (Quality % 
+                to Goal, VOC % to Goal, and Accuracy % to Goal). Sanitizes Workday IDs, builds a clean 
+                master primary key (Manager_WDID|Month|Year|Program|Country), and left-joins each 
+                individual metric block to assemble the consolidated reporting view.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_managger_rolled_up_consolidated` AS
+
+  /* ===========================================================================
+     BLOCK 1: MASTER SKELETON
+     Collects and standardizes the universe of unique composite keys (Manager Workday ID, Month, 
+     Year, Program, Country, Region) across all three Manager detailed source tables. Filters out 
+     null Workday IDs to maintain dimension integrity.
+  =========================================================================== */
+  WITH master_skeleton AS (
+      SELECT 
+        wdid_manager, 
+        report_month, 
+        report_year, 
+        program, 
+        country, 
+        region,  
+        MAX(role) as role, 
+        MAX(manager_name) as manager_name, 
+        MAX(tl_sr_manager) as tl_sr_manager
+      FROM (
+        SELECT 
+          SAFE_CAST(wdid_manager AS STRING) as wdid_manager, 
+          SAFE_CAST(report_month AS STRING) as report_month, 
+          SAFE_CAST(report_year AS STRING) as report_year, 
+          SAFE_CAST(program AS STRING) as program, 
+          role, manager_name, tl_sr_manager, country, region 
+        FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_ptg_manager_detailed` 
+        
+        UNION ALL
+        
+        SELECT 
+          SAFE_CAST(wdid_manager AS STRING) as wdid_manager, 
+          SAFE_CAST(report_month AS STRING) as report_month, 
+          SAFE_CAST(report_year AS STRING) as report_year, 
+          SAFE_CAST(program AS STRING) as program, 
+          role, manager_name, tl_sr_manager, country, region 
+        FROM `ti-ca-ml-start.QA_Training_scorecards.2026_voc_ptg_manager_detailed` 
+        
+        UNION ALL
+        
+        SELECT 
+          SAFE_CAST(wdid_manager AS STRING) as wdid_manager, 
+          SAFE_CAST(report_month AS STRING) as report_month, 
+          SAFE_CAST(report_year AS STRING) as report_year, 
+          SAFE_CAST(program AS STRING) as program, 
+          role, manager_name, tl_sr_manager, country, region 
+        FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_manager_detailed`
+      )
+      WHERE wdid_manager IS NOT NULL
+      GROUP BY 1, 2, 3, 4, 5, 6
+  ),
+
+  /* ===========================================================================
+     BLOCK 2: INDIVIDUAL METRIC BLOCKS
+     =========================================================================== */
+
+  /* CTE 2.1: QUALITY PERCENT TO GOAL BLOCK
+     Extracts and formats rolled-up Manager quality scores, capping metrics, and program-diluted weights. */
+  qa_block AS (
+      SELECT 
+        SAFE_CAST(wdid_manager AS STRING) as wdid_manager, 
+        SAFE_CAST(report_month AS STRING) as report_month, 
+        SAFE_CAST(report_year AS STRING) as report_year, 
+        SAFE_CAST(program AS STRING) as program,
+        country, 
+        region,  
+        MAX(qaptg_business_category) as qaptg_business_category,
+        MAX(qa_kpi) as qa_kpi,
+        MAX(qa_kpi_applicable) as qa_kpi_applicable,
+        MAX(qa_exempt) as qa_exempt,
+        MAX(qa_reason) as qa_reason,
+        MAX(quality_score_actual) as quality_score_actual,
+        MAX(quality_score_target_program) as quality_score_target_program,
+        MAX(final_total_programs) as qa_final_total_programs,
+        MAX(qa_weight) as qa_weight,
+        MAX(qa_single_multi_program) as qa_single_multi_program,
+        MAX(qa_single_program) as qa_single_program,
+        MAX(quality_multi_program) as quality_multi_program,
+        MAX(qa_perf_vs_cap_uncapped) as qa_perf_vs_cap_uncapped,
+        MAX(adjusted_score_based_on_cap) as qa_adjusted_score_based_on_cap,
+        MAX(achievement_category) as qa_achievement_category,
+        MAX(qa_points_obtained) as qa_points_obtained,
+        MAX(qa_weight_obtaiend) as qa_weight_obtaiend,
+        MAX(qa_points_obtained_for_final_score_only) as qa_points_obtained_for_final_score_only,
+        MAX(qa_weight_obtaiend_program_diluted) as qa_weight_obtaiend_program_diluted,
+        MAX(qa_points_obtained_for_final_score_only_program_diluted) as qa_points_obtained_for_final_score_only_program_diluted
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_ptg_manager_detailed`
+      GROUP BY 1, 2, 3, 4, 5, 6
+  ),
+
+  /* CTE 2.2: VOC PERCENT TO GOAL BLOCK
+     Extracts and formats rolled-up Manager VOC scores, capping metrics, and program-diluted weights. */
+  voc_block AS (
+      SELECT 
+        SAFE_CAST(wdid_manager AS STRING) as wdid_manager, 
+        SAFE_CAST(report_month AS STRING) as report_month, 
+        SAFE_CAST(report_year AS STRING) as report_year, 
+        SAFE_CAST(program AS STRING) as program,
+        country, 
+        region,  
+        MAX(voc_business_category) as voc_business_category,
+        MAX(voc_kpi) as voc_kpi,
+        MAX(voc_kpi_applicable) as voc_kpi_applicable,
+        MAX(voc_exempt) as voc_exempt,
+        MAX(voc_reason) as voc_reason,
+        MAX(voc_score_actual) as voc_score_actual,
+        MAX(voc_score_target_program) as voc_score_target_program,
+        MAX(final_total_programs) as voc_final_total_programs,
+        MAX(voc_weight) as voc_weight,
+        MAX(voc_single_multi_program) as voc_single_multi_program,
+        MAX(voc_single_program) as voc_single_program,
+        MAX(voc_multi_program) as voc_multi_program,
+        MAX(voc_perf_vs_cap_uncapped) as voc_perf_vs_cap_uncapped,
+        MAX(adjusted_score_based_on_cap) as voc_adjusted_score_based_on_cap,
+        MAX(achievement_category) as voc_achievement_category,
+        MAX(voc_points_obtained) as voc_points_obtained,
+        MAX(voc_weight_obtaiend) as voc_weight_obtaiend,
+        MAX(voc_points_obtained_for_final_score_only) as voc_points_obtained_for_final_score_only,
+        MAX(voc_weight_obtaiend_program_diluted) as voc_weight_obtaiend_program_diluted,
+        MAX(voc_points_obtained_for_final_score_only_program_diluted) as voc_points_obtained_for_final_score_only_program_diluted
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_voc_ptg_manager_detailed`
+      GROUP BY 1, 2, 3, 4, 5, 6
+  ),
+
+  /* CTE 2.3: ACCURACY PERCENT TO GOAL BLOCK
+     Extracts calibration accuracy, dispute volumes, accuracy PTG, and diluted scorecard weights. */
+  acc_block AS (
+      SELECT 
+        SAFE_CAST(wdid_manager AS STRING) as wdid_manager, 
+        SAFE_CAST(report_month AS STRING) as report_month, 
+        SAFE_CAST(report_year AS STRING) as report_year, 
+        SAFE_CAST(program AS STRING) as program,
+        country, 
+        region,  
+        MAX(accuracy_business_category) as accuracy_business_category,
+        MAX(kpi) as accuracy_kpi,
+        MAX(cal_accurate) as cal_accurate,
+        MAX(cal_performed) as cal_performed,
+        MAX(valid_disputes) as valid_disputes,
+        MAX(total_completed_evals) as total_completed_evals,
+        MAX(accurate_evals) as accurate_evals,
+        MAX(final_total_programs) as acc_final_total_programs,
+        MAX(accuracy_target_master) as accuracy_target_master,
+        MAX(accuracy_weight_master) as accuracy_weight_master,
+        MAX(accuracy_pct_to_goal) as accuracy_pct_to_goal,
+        MAX(accuracy_points_obtained) as accuracy_points_obtained,
+        MAX(accuracy_achievement_category) as accuracy_achievement_category,
+        MAX(accuracy_points_obtained_for_final_score_only) as accuracy_points_obtained_for_final_score_only,
+        MAX(accuracy_earned_weight) as accuracy_earned_weight,
+        MAX(accuracy_weight_diluted) as accuracy_weight_diluted
+      FROM `ti-ca-ml-start.QA_Training_scorecards.2026_qa_accuracy_manager_detailed`
+      GROUP BY 1, 2, 3, 4, 5, 6
+  )
+
+  /* ===========================================================================
+     BLOCK 3: FINAL ASSEMBLY
+     Joins all three individual metric blocks back to the master dimension skeleton 
+     using a 6-key composite LEFT JOIN (Manager_WDID, Month, Year, Program, Country, Region).
+  =========================================================================== */
+  SELECT 
+    CONCAT(s.wdid_manager, '|', s.report_month, '|', s.report_year, '|', s.program, '|', s.country) as primary_key,
+    s.*,
+    qa.* EXCEPT(wdid_manager, report_month, report_year, program, country, region),
+    voc.* EXCEPT(wdid_manager, report_month, report_year, program, country, region),
+    acc.* EXCEPT(wdid_manager, report_month, report_year, program, country, region)
+  FROM master_skeleton s
+  LEFT JOIN qa_block qa ON s.wdid_manager = qa.wdid_manager AND s.report_month = qa.report_month AND s.report_year = qa.report_year AND s.program = qa.program AND s.country = qa.country AND s.region = qa.region
+  LEFT JOIN voc_block voc ON s.wdid_manager = voc.wdid_manager AND s.report_month = voc.report_month AND s.report_year = voc.report_year AND s.program = voc.program AND s.country = voc.country AND s.region = voc.region
+  LEFT JOIN acc_block acc ON s.wdid_manager = acc.wdid_manager AND s.report_month = acc.report_month AND s.report_year = acc.report_year AND s.program = acc.program AND s.country = acc.country AND s.region = acc.region;
+
+END;
