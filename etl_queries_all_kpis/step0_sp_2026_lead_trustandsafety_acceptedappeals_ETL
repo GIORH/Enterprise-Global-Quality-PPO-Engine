@@ -1,0 +1,164 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_acceptedappeals_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_lead_trustandsafety_acceptedappeals_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Accepted Appeals % to Goal' KPI for 
+                Trust & Safety Quality Team Leads. This procedure rolls up granular data to 
+                the team level, computes performance ratios against the 0.975 target baseline, 
+                maps scores to standard achievement tiers, and calculates the final weighted 
+                scorecard impacts based on a 15% metric weight.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_trustandsafety_acceptedappeals_ETL` AS
+
+  /* =========================================================================================
+     CTE 1: TEAM LEVEL ROLL-UP & EXEMPTION HANDLING
+     Aggregates operational Accepted Appeals volumes at the Team Lead, program, and regional level.
+     Evaluates analyst-level exemption flags to determine if the entire team qualifies for 
+     exemption or applicability. Safely sums actual and target volumes, strictly omitting 
+     exempt records to preserve calculation integrity.
+  ========================================================================================= */
+  WITH QA_Appeals_Source AS (
+    SELECT
+      MAX(timestamp) AS timestamp, 
+      SAFE.PARSE_DATE('%d %B %Y', CONCAT('01 ', TRIM(report_month), ' ', CAST(report_year AS STRING))) AS date,
+      report_month, 
+      report_year, 
+      tl_wdid, 
+      tl_name, 
+      tl_manager, 
+      tl_sr_manager, 
+      program, 
+      country, 
+      region,
+      
+      SUM(CASE WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(aa_actual AS FLOAT64) END) AS aa_actual,
+      SUM(CASE WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(aa_score_target_program AS FLOAT64) END) AS aa_score_target_program,
+      
+      IF(COUNTIF(UPPER(TRIM(aa_kpi_applicable)) = 'NO') = COUNT(*), 'No', 'Yes') AS aa_kpi_applicable,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), 'Yes', 'No') AS aa_exempt,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), 'Whole team exempt', NULL) AS aa_notes,
+      IF(COUNTIF(UPPER(TRIM(aa_exempt)) = 'YES') = COUNT(*), MAX(aa_reason), NULL) AS aa_reason
+    FROM `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_raw`
+    GROUP BY report_month, report_year, tl_wdid, tl_name, tl_manager, tl_sr_manager, program, country, region
+  ),
+
+  /* =========================================================================================
+     CTE 2: METRIC BENCHMARKING & RATIO CALCULATION
+     Injects static scorecard metadata, including the business category, 15% metric weight, 
+     and the 0.975 master target. Calculates the preliminary performance ratio before computing 
+     the final Percentage to Goal (PTG) against the master target benchmark.
+  ========================================================================================= */
+  TL_Accepted_Appeals_PTG AS (
+    SELECT
+      *,
+      'My Customer' AS accepted_appeals_business_category, 
+      'Accepted Appeals % to Goal' AS accepted_appeals_kpi, 
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.975 
+      END AS accepted_appeals_target_master,
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE 0.15 
+      END AS accepted_appeals_weight_master,
+      
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL
+        ELSE SAFE_DIVIDE(aa_score_target_program - aa_actual, aa_score_target_program)
+      END AS accepted_appeals_performance_before_goal,
+      
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE SAFE_DIVIDE(aa_score_target_program - aa_actual, aa_score_target_program) / 0.975 
+      END AS accepted_appeals_ptg
+    FROM QA_Appeals_Source
+  ),
+
+  /* =========================================================================================
+     CTE 3: METRIC TIERING & POINT ALLOCATION
+     Maps the computed Percentage to Goal (PTG) against continuous Trust & Safety performance 
+     thresholds to assign the standard Achievement Tier. Allocates the corresponding 4-point 
+     scale metric points based on the assigned tier.
+  ========================================================================================= */
+  TL_Accepted_Appeals_Scores AS (
+    SELECT
+      *,
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 'Improvement Required' 
+        WHEN accepted_appeals_ptg < 0.95 THEN 'Developing' 
+        WHEN accepted_appeals_ptg < 0.96 THEN 'Achieving' 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 'Excelling' 
+        ELSE NULL 
+      END AS acceptes_appeals_achievement_tier,
+      
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        WHEN accepted_appeals_ptg < 0.85 THEN 1 
+        WHEN accepted_appeals_ptg < 0.95 THEN 2 
+        WHEN accepted_appeals_ptg < 0.96 THEN 3 
+        WHEN accepted_appeals_ptg >= 0.96 THEN 4 
+        ELSE 0 
+      END AS accepted_appeals_points_obtained
+    FROM TL_Accepted_Appeals_PTG
+  ),
+
+  /* =========================================================================================
+     CTE 4: WEIGHT DISTRIBUTION & SCORING
+     Calculates the scorecard impacts by translating the 4-point scale into quartered fractional 
+     weights. Generates the final numerical points necessary for global scorecard aggregation.
+  ========================================================================================= */
+  TL_Accepted_Appeals_Block AS (
+    SELECT
+      *,
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE (accepted_appeals_points_obtained / 4) * accepted_appeals_weight_master 
+      END AS accepted_appeals_weight_obtained,
+      CASE 
+        WHEN UPPER(TRIM(aa_kpi_applicable)) = 'NO' OR UPPER(TRIM(aa_exempt)) = 'YES' THEN NULL 
+        ELSE accepted_appeals_points_obtained * accepted_appeals_weight_master 
+      END AS accepted_appeals_points_final_score
+    FROM TL_Accepted_Appeals_Scores
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: SCORECARD MAPPING
+     Finalizes the dataset by selecting all foundational dimensions alongside the fully computed 
+     and weighted Accepted Appeals metrics.
+  ========================================================================================= */
+  SELECT 
+    timestamp,
+    date,
+    report_month,
+    report_year,
+    tl_wdid,
+    tl_name,
+    tl_manager,
+    tl_sr_manager,
+    program,
+    country,
+    region,
+
+    accepted_appeals_business_category,
+    accepted_appeals_kpi,
+    accepted_appeals_target_master,
+    accepted_appeals_weight_master,
+    aa_actual,
+    aa_score_target_program,
+    accepted_appeals_performance_before_goal,
+    accepted_appeals_ptg,
+    acceptes_appeals_achievement_tier,
+    accepted_appeals_points_obtained,
+    accepted_appeals_weight_obtained,
+    accepted_appeals_points_final_score,
+    aa_notes,
+    aa_kpi_applicable,
+    aa_exempt,
+    aa_reason
+
+  FROM TL_Accepted_Appeals_Block;
+
+END;
