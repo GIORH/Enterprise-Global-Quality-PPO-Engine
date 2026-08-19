@@ -1,0 +1,208 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_analyst_trustandsafety_non_rolled_up_consolidated`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step1_sp_2026_scorecard_analyst_trustandsafety_non_rolled_up_consolidated
+   DESCRIPTION: Master ETL pipeline calculating non-rolled-up individual metrics (Team Development 
+                and Personal Professional Development - PPD) for Trust & Safety CX Quality Analysts. 
+                Evaluates monthly non-cumulative completion ratios against target thresholds to assign 
+                performance tiers and metric points. Simultaneously tracks windowed Year-to-Date (YTD) 
+                volume progressions for audit and tracking purposes.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.step1_sp_2026_scorecard_analyst_trustandsafety_non_rolled_up_consolidated` AS
+
+  /* ===============================================================================================
+     1. IDENTIFICATION BLOCK (HEADER)
+     Extracts base operational dimensions and parses reporting timestamps into standard BigQuery DATE 
+     types to support downstream Year-to-Date (YTD) window partition orderings.
+  =============================================================================================== */
+  WITH HeaderData AS (
+    SELECT
+      timestamp, 
+      submitter_email, 
+      report_month, 
+      report_year, 
+      tl_wdid, 
+      tl_name, 
+      tl_manager, 
+      tl_sr_manager, 
+      tm_wdid, 
+      tm_name, 
+      country, 
+      region,
+      SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(CAST(report_month AS STRING), 1, 3)), ' ', CAST(report_year AS STRING))) AS parsed_date
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_2_raw`
+  ),
+
+  /* ===============================================================================================
+     2. METRIC BLOCK: TEAM DEVELOPMENT (MONTHLY + YTD CUMULATIVE)
+     Calculates discrete monthly and cumulative YTD workshop completion metrics. Evaluates monthly 
+     Percentage to Goal (PTG) against the 1.00 master target and assigns 20% metric weight distributions.
+  =============================================================================================== */
+  Team_Development_Step1_Base AS (
+    SELECT
+      h.timestamp, 
+      h.submitter_email, 
+      h.report_month, 
+      h.report_year, 
+      h.tl_wdid, 
+      h.tl_name, 
+      h.tl_manager, 
+      h.tl_sr_manager, 
+      h.tm_wdid, 
+      h.tm_name, 
+      h.country, 
+      h.region,
+      'My Team' AS teamdevelopment_business_category,
+      'Team Development' AS teamdevelopment_kpi,
+  
+      -- Monthly discrete delivered workshops (nullified if exempt or non-applicable)
+      CASE WHEN UPPER(TRIM(raw.td_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.td_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(raw.workshops_delivered AS FLOAT64) END AS workshops_delivered,
+      -- Year-to-Date (YTD) cumulative delivered workshops
+      SUM(CASE WHEN UPPER(TRIM(raw.td_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.td_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(raw.workshops_delivered AS FLOAT64) END) OVER (PARTITION BY h.tm_wdid, h.report_year ORDER BY h.parsed_date) AS workshops_delivered_ytd,
+
+      -- Monthly discrete required workshops
+      CASE WHEN UPPER(TRIM(raw.td_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.td_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(raw.workshops_required AS FLOAT64) END AS workshops_required,
+      -- Year-to-Date (YTD) cumulative required workshops
+      SUM(CASE WHEN UPPER(TRIM(raw.td_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.td_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(raw.workshops_required AS FLOAT64) END) OVER (PARTITION BY h.tm_wdid, h.report_year ORDER BY h.parsed_date) AS workshops_required_ytd,
+
+      raw.td_notes,
+      raw.td_kpi_applicable,
+      raw.td_exempt,
+      raw.td_reason,
+      CASE 
+        WHEN UPPER(TRIM(raw.td_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.td_exempt)) = 'YES' THEN NULL 
+        ELSE 1.00 
+      END AS teamdevelopment_target_master,
+      CASE 
+        WHEN UPPER(TRIM(raw.td_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.td_exempt)) = 'YES' THEN NULL 
+        ELSE 0.20 
+      END AS teamdevelopment_weight_master,
+      
+      -- Monthly non-cumulative Percentage to Goal (PTG) ratio
+      CASE WHEN UPPER(TRIM(raw.td_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.td_exempt)) = 'YES' THEN NULL ELSE SAFE_DIVIDE(SAFE_CAST(raw.workshops_delivered AS FLOAT64), SAFE_CAST(raw.workshops_required AS FLOAT64)) END AS teamdevelopment_ptg
+    FROM HeaderData h
+    JOIN `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_2_raw` raw
+      ON h.tm_wdid = raw.tm_wdid AND h.report_month = raw.report_month AND h.report_year = raw.report_year
+  ),
+
+  Team_Development_Step2_Tiers_And_Points AS (
+    SELECT
+      *,
+      -- Monthly Team Development performance tier classification
+      CASE 
+        WHEN UPPER(TRIM(td_kpi_applicable)) = 'NO' OR UPPER(TRIM(td_exempt)) = 'YES' THEN NULL
+        WHEN teamdevelopment_ptg IS NULL THEN NULL
+        WHEN teamdevelopment_ptg < 1.00 THEN 'Improvement Required'
+        WHEN teamdevelopment_ptg <= 1.00 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS team_development_achievement_category,
+
+      -- Monthly Team Development metric point allocation (4-point scale)
+      CASE 
+        WHEN UPPER(TRIM(td_kpi_applicable)) = 'NO' OR UPPER(TRIM(td_exempt)) = 'YES' THEN NULL
+        WHEN teamdevelopment_ptg IS NULL THEN NULL
+        WHEN teamdevelopment_ptg < 1.00 THEN 1
+        WHEN teamdevelopment_ptg <= 1.00 THEN 3
+        ELSE 4
+      END AS team_developoment_points
+    FROM Team_Development_Step1_Base
+  ),
+
+  Team_Development_Final_Block AS (
+    SELECT 
+      *,
+      CASE WHEN UPPER(TRIM(td_kpi_applicable)) = 'NO' OR UPPER(TRIM(td_exempt)) = 'YES' THEN NULL ELSE (team_developoment_points / 4) * teamdevelopment_weight_master END AS team_development_weight_obtained,
+      CASE WHEN UPPER(TRIM(td_kpi_applicable)) = 'NO' OR UPPER(TRIM(td_exempt)) = 'YES' THEN NULL ELSE team_developoment_points * teamdevelopment_weight_master END AS team_development_points_final_score
+    FROM 
+      Team_Development_Step2_Tiers_And_Points
+  ),
+
+  /* ===============================================================================================
+     3. METRIC BLOCK: PPD (PERSONAL PROFESSIONAL DEVELOPMENT)
+     Calculates discrete monthly and cumulative YTD course completion metrics. Evaluates monthly 
+     Percentage to Goal (PTG) against the 1.00 master target and assigns 15% metric weight distributions.
+  =============================================================================================== */
+  PPD_Step1_Base AS (
+    SELECT
+      td.*,
+      'My Team' AS ppd_business_category,
+      'personal_professional_development' AS ppd_kpi,
+      
+      -- Monthly discrete completed courses (nullified if exempt or non-applicable)
+      CASE WHEN UPPER(TRIM(raw.ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.ppd_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(raw.courses_completed AS FLOAT64) END AS courses_completed,
+      -- Year-to-Date (YTD) cumulative completed courses
+      SUM(CASE WHEN UPPER(TRIM(raw.ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.ppd_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(raw.courses_completed AS FLOAT64) END) OVER (PARTITION BY td.tm_wdid, td.report_year ORDER BY SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(CAST(td.report_month AS STRING), 1, 3)), ' ', CAST(td.report_year AS STRING)))) AS courses_completed_ytd,
+
+      -- Monthly discrete required courses
+      CASE WHEN UPPER(TRIM(raw.ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.ppd_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(raw.courses_required AS FLOAT64) END AS courses_required,
+      -- Year-to-Date (YTD) cumulative required courses
+      SUM(CASE WHEN UPPER(TRIM(raw.ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.ppd_exempt)) = 'YES' THEN NULL ELSE SAFE_CAST(raw.courses_required AS FLOAT64) END) OVER (PARTITION BY td.tm_wdid, td.report_year ORDER BY SAFE.PARSE_DATE('%b %E4Y', CONCAT(INITCAP(SUBSTR(CAST(td.report_month AS STRING), 1, 3)), ' ', CAST(td.report_year AS STRING)))) AS courses_required_ytd,
+
+      raw.ppd_notes,
+      raw.ppd_kpi_applicable,
+      raw.ppd_exempt,
+      raw.ppd_reason,
+      CASE 
+        WHEN UPPER(TRIM(raw.ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.ppd_exempt)) = 'YES' THEN NULL 
+        ELSE 1.00 
+      END AS ppd_target_master,
+      CASE 
+        WHEN UPPER(TRIM(raw.ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.ppd_exempt)) = 'YES' THEN NULL 
+        ELSE 0.15 
+      END AS ppd_weight_master,
+      
+      -- Monthly non-cumulative Percentage to Goal (PTG) ratio
+      CASE WHEN UPPER(TRIM(raw.ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(raw.ppd_exempt)) = 'YES' THEN NULL ELSE SAFE_DIVIDE(SAFE_CAST(raw.courses_completed AS FLOAT64), SAFE_CAST(raw.courses_required AS FLOAT64)) END AS ppd_ptg
+    FROM Team_Development_Final_Block td
+    JOIN `ti-ca-ml-start.QA_Training_scorecards.2026_ts_qa_consolidated_kpis_2_raw` raw
+      ON td.tm_wdid = raw.tm_wdid AND td.report_month = raw.report_month AND td.report_year = raw.report_year
+  ),
+
+  PPD_Step2_Tiers_And_Points AS (
+    SELECT
+      *,
+      -- Monthly PPD performance tier classification
+      CASE 
+        WHEN UPPER(TRIM(ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(ppd_exempt)) = 'YES' THEN NULL
+        WHEN ppd_ptg IS NULL THEN NULL
+        WHEN ppd_ptg < 0.50 THEN 'Improvement Required'
+        WHEN ppd_ptg < 1.00 THEN 'Developing'
+        WHEN ppd_ptg <= 1.00 THEN 'Achieving'
+        ELSE 'Excelling'
+      END AS ppd_achievement_category,
+
+      -- Monthly PPD metric point allocation (4-point scale)
+      CASE 
+        WHEN UPPER(TRIM(ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(ppd_exempt)) = 'YES' THEN NULL
+        WHEN ppd_ptg IS NULL THEN NULL
+        WHEN ppd_ptg < 0.50 THEN 1
+        WHEN ppd_ptg < 1.00 THEN 2
+        WHEN ppd_ptg <= 1.00 THEN 3
+        ELSE 4
+      END AS ppd_points
+    FROM PPD_Step1_Base
+  ),
+
+  PPD_Final_Block AS (
+    SELECT 
+      *,
+      CASE WHEN UPPER(TRIM(ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(ppd_exempt)) = 'YES' THEN NULL ELSE (ppd_points / 4) * ppd_weight_master END AS ppd_weight_earn,
+      CASE WHEN UPPER(TRIM(ppd_kpi_applicable)) = 'NO' OR UPPER(TRIM(ppd_exempt)) = 'YES' THEN NULL ELSE ppd_points * ppd_weight_master END AS ppd_final_points
+    FROM 
+      PPD_Step2_Tiers_And_Points
+  )
+
+  /* ===============================================================================================
+     FINAL MASTER SELECTION
+     Compiles the finalized Trust & Safety non-rolled-up dataset containing both Team Development 
+     and PPD performance scoring metrics.
+  =============================================================================================== */
+  SELECT 
+    * 
+  FROM 
+    PPD_Final_Block;
+
+END;
