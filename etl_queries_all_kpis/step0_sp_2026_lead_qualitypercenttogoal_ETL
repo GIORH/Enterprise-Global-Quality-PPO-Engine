@@ -1,0 +1,210 @@
+CREATE OR REPLACE PROCEDURE `ti-ca-ml-start.QA_Training_scorecards.step0_sp_2026_lead_qualitypercenttogoal_ETL`()
+BEGIN
+
+  /************************************************************************************************
+   PROCEDURE: step0_sp_2026_lead_qualitypercenttogoal_ETL
+   DESCRIPTION: Master ETL pipeline aggregating the 'Quality % to Goal' KPI from the Analyst 
+                level up to the CX Quality Team Lead hierarchy. It evaluates rolled-up team 
+                performance, applies multi-program capping to normalize outliers, maps scores 
+                to standard achievement tiers, and calculates diluted scorecard weights to 
+                ensure balanced global aggregation.
+  ************************************************************************************************/
+
+  CREATE OR REPLACE TABLE `ti-ca-ml-start.QA_Training_scorecards.2026_qa_ptg_team_lead_detailed` AS
+  
+  /* =========================================================================================
+     CTE 1: HIERARCHICAL PROGRAM FOOTPRINT
+     Determines the exact number of applicable, non-exempt programs managed by each Team Lead 
+     per month. This distinct count is critical for triggering the appropriate multi-program 
+     capping and weight dilution logic downstream.
+  ========================================================================================= */
+  WITH ProgramCounts AS (
+    SELECT 
+      tl_wdid, 
+      report_month, 
+      report_year, 
+      COUNT(DISTINCT CASE WHEN UPPER(kpi_applicable) = 'YES' AND UPPER(exempt) = 'NO' THEN CONCAT(program, COALESCE(country, ''), COALESCE(region, '')) END) AS final_total_programs
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qa_quality_raw`
+    GROUP BY 1, 2, 3
+  ),
+
+  /* =========================================================================================
+     CTE 2: ANALYST-TO-LEAD METRIC AGGREGATION
+     Rolls up the granular analyst-level scores into a unified Team Lead view. Consolidates 
+     applicability flags and averages the quality scores exclusively for active, non-exempt 
+     analysts to protect the integrity of the hierarchical average. Allocates the 15% metric weight.
+  ========================================================================================= */
+  CalculatedData AS (
+    SELECT 
+      'CX Quality Team Lead and Sr Team lead' AS role,
+      MAX(raw.timestamp) AS timestamp, 
+      MAX(raw.submitter_email) AS submitter_email,
+      raw.report_month,
+      raw.report_year,
+      raw.tl_wdid,
+      raw.tl_name,
+      raw.tl_manager,
+      raw.tl_sr_manager,
+      raw.program,
+      raw.country,
+      raw.region,
+      'My Customer' AS qaptg_business_category,
+      'Quality % to Goal' AS qa_kpi,
+      'Team Aggregated Data' AS qa_notes,
+      
+      -- Consolidates analyst-level flags to determine hierarchical Team Lead metric applicability
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') > 0, 'Yes', 'No') AS qa_kpi_applicable,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0, 'No', 'Yes') AS qa_exempt,
+      IF(COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0, 'Rolled up by TL and Program', 'Exempt') AS qa_reason,
+      
+      -- Calculates the team average scores safely excluding exempt analysts
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') = 0 OR COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64) ELSE NULL END))) AS quality_score_actual,
+      IF(COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') = 0 OR COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') = 0, NULL, FORMAT('%.2f%%', AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64) ELSE NULL END))) AS quality_score_target_program,
+      
+      pc.final_total_programs,
+      
+      -- Static metric weight allocation (15%) with hierarchical exemption logic
+      CASE 
+        WHEN COUNTIF(LOWER(TRIM(raw.kpi_applicable)) = 'yes') > 0 AND COUNTIF(LOWER(TRIM(raw.exempt)) = 'no') > 0 THEN 0.15 
+        ELSE NULL 
+      END AS qa_weight,
+
+      -- Standardized Percentage to Goal ratio based on active analyst averages
+      SAFE_DIVIDE(
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+      ) AS qa_single_multi_program,
+
+      -- Isolates the ratio strictly for Team Leads supporting a single program
+      CASE 
+        WHEN pc.final_total_programs = 1 THEN
+          SAFE_DIVIDE(
+            AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+            AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+          )
+        ELSE NULL 
+      END AS qa_single_program,
+
+      -- Preserves the unaltered ratio to fuel the multi-program capping engine
+      SAFE_DIVIDE(
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.quality_score_actual, '%', '') AS FLOAT64) ELSE NULL END), 
+        AVG(CASE WHEN LOWER(TRIM(raw.exempt)) = 'no' THEN CAST(REPLACE(raw.quality_score_target_program, '%', '') AS FLOAT64) ELSE NULL END)
+      ) AS _raw_calc
+    FROM 
+      `ti-ca-ml-start.QA_Training_scorecards.2026_qa_quality_raw` AS raw
+    LEFT JOIN 
+      ProgramCounts AS pc 
+      ON raw.tl_wdid = pc.tl_wdid AND raw.report_month = pc.report_month AND raw.report_year = pc.report_year
+    GROUP BY 
+      4,5,6,7,8,9,10,11,12, pc.final_total_programs
+  ),
+
+  /* =========================================================================================
+     CTE 3: MULTI-PROGRAM CAPPING LOGIC
+     Normalizes performance outliers for Team Leads managing multiple programs. Applies a 
+     continuous range logic to group raw averaged scores into predefined capped tiers, 
+     preventing mathematical gaps during performance evaluation.
+  ========================================================================================= */
+  CappedData AS (
+    SELECT 
+      * EXCEPT(_raw_calc),
+      IF(qa_exempt = 'Yes', NULL,
+        CASE 
+          WHEN final_total_programs >= 2 THEN
+            CASE 
+              WHEN _raw_calc <= 0.50 THEN 0
+              WHEN _raw_calc <= 0.85 THEN 0.50
+              WHEN _raw_calc < 1.00  THEN 0.75
+              WHEN _raw_calc < 1.15  THEN 1.00
+              WHEN _raw_calc >= 1.15 THEN 1.15
+              ELSE _raw_calc
+            END
+          ELSE NULL 
+        END) AS quality_multi_program,
+      IF(qa_exempt = 'Yes', NULL,
+        COALESCE(qa_single_program, 
+                 CASE WHEN final_total_programs >= 2 THEN
+                   CASE 
+                     WHEN _raw_calc <= 0.50 THEN 0
+                     WHEN _raw_calc <= 0.85 THEN 0.50
+                     WHEN _raw_calc < 1.00  THEN 0.75
+                     WHEN _raw_calc < 1.15  THEN 1.00
+                     WHEN _raw_calc >= 1.15 THEN 1.15
+                     ELSE _raw_calc
+                   END
+                 ELSE NULL END)) AS qa_perf_vs_cap_uncapped
+    FROM 
+      CalculatedData
+  ),
+
+  /* =========================================================================================
+     CTE 4: DILUTION, TIERING & POINT ASSIGNMENT
+     Calculates the program-adjusted score and maps it against continuous performance 
+     thresholds to assign the final Achievement Category and standardized Metric Points (1-4).
+  ========================================================================================= */
+  CategorizedAndPointsData AS (
+    SELECT
+      *,
+      -- Dilutes the capped score evenly across the Team Lead's total active programs
+      IF(qa_exempt = 'Yes', NULL, qa_perf_vs_cap_uncapped * SAFE_DIVIDE(1.0, final_total_programs)) AS adjusted_score_based_on_cap,
+
+      -- Continuous tier mapping to prevent evaluation gaps
+      IF(qa_exempt = 'Yes', NULL,
+        CASE 
+          WHEN qa_perf_vs_cap_uncapped < 0.90 THEN 'Improvement Required'
+          WHEN qa_perf_vs_cap_uncapped < 1.00 THEN 'Developing'
+          WHEN qa_perf_vs_cap_uncapped < 1.01 THEN 'Achieving'
+          WHEN qa_perf_vs_cap_uncapped >= 1.01 THEN 'Excelling'
+          ELSE NULL 
+        END) AS achievement_category,
+      
+      -- Standardized 4-point scale assignment based on performance tier
+      IF(qa_exempt = 'Yes', NULL,
+        CASE 
+          WHEN qa_perf_vs_cap_uncapped < 0.90 THEN 1
+          WHEN qa_perf_vs_cap_uncapped < 1.00 THEN 2
+          WHEN qa_perf_vs_cap_uncapped < 1.01 THEN 3
+          WHEN qa_perf_vs_cap_uncapped >= 1.01 THEN 4
+          ELSE NULL 
+        END) AS qa_points_obtained
+    FROM 
+      CappedData
+  )
+
+  /* =========================================================================================
+     FINAL OUTPUT: WEIGHT DISTRIBUTION & SCORING
+     Finalizes the scorecard presentation layer. Calculates the final numerical points and 
+     formatted earned weights, distributing the impact proportionally across the managed 
+     program footprint to ensure accurate global scorecard aggregation.
+  ========================================================================================= */
+  SELECT 
+    *,
+    -- Calculates the fractional weight obtained (quartered based on a 4-point scale)
+    IF(qa_exempt = 'Yes', NULL, (qa_points_obtained / 4.0) * qa_weight) AS qa_weight_obtained,
+
+    -- Numerical points derived for final global score aggregation
+    IF(qa_exempt = 'Yes', NULL, qa_points_obtained * qa_weight) AS qa_points_obtained_for_final_score_only,
+    
+    -- Dilutes the earned fractional weight proportionally across the active managed footprint
+    IF(qa_exempt = 'Yes', NULL,
+      (CASE 
+        WHEN achievement_category = 'Improvement Required' THEN qa_weight * 0.25
+        WHEN achievement_category = 'Developing' THEN qa_weight * 0.50
+        WHEN achievement_category = 'Achieving' THEN qa_weight * 0.75
+        WHEN achievement_category = 'Excelling' THEN qa_weight * 1.00
+        ELSE NULL 
+      END) * SAFE_DIVIDE(1.0, final_total_programs)) AS qa_weight_obtaiend_program_diluted,
+
+    -- Program-diluted final numerical points generation for proportional scorecard aggregation
+    IF(qa_exempt = 'Yes', NULL,
+      CASE 
+        WHEN final_total_programs = 1 THEN CAST(qa_points_obtained * qa_weight AS FLOAT64)
+        ELSE CAST(qa_points_obtained * SAFE_DIVIDE(qa_weight, final_total_programs) AS FLOAT64)
+      END
+    ) AS qa_points_obtained_for_final_score_only_program_diluted
+
+  FROM 
+    CategorizedAndPointsData;
+
+END;
